@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="How zgui-bridge and stryke-app let a stryke script call an app&#x27;s verbs, read its state, subscribe to its events, and roll back a chain of calls across several apps.">
+  <title>The GUI Automation Bus — Driving GUI Apps from stryke by Verb Name — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/gui-automation-bus-stryke-app.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">11 posts · 29 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>The GUI Automation Bus — Driving GUI Apps from stryke by Verb Name</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 4 min read <span class="sep">·</span> <a class="post-tag" href="../tags/stryke.html">#stryke</a> <a class="post-tag" href="../tags/automation.html">#automation</a> <a class="post-tag" href="../tags/ipc.html">#ipc</a> <a class="post-tag" href="../tags/gui.html">#gui</a></span></p>
+      <article class="tutorial-section post-body">
+<p>The GUI Automation Bus lets a stryke script call a GUI app&#x27;s named verbs, read its state, and subscribe to its events, either from inside the app or from a terminal. It is semantic, not pixel-level: where <code>stryke-gui</code> moves the mouse, the bus calls <code>library.search</code> and gets rows back.</p>
+<p>Three pieces:</p>
+<table>
+<thead><tr><th>Piece</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>docs/GUI_AUTOMATION_BUS.md</code> in <a href="https://github.com/MenkeTechnologies/MenkeTechnologiesMeta" target="_blank" rel="noopener noreferrer">MenkeTechnologiesMeta</a></td><td>Design doc (RFC), status: shipped (Track A)</td></tr>
+<tr><td><code>zgui-bridge</code></td><td>Rust crate each app links to host the bus endpoint</td></tr>
+<tr><td><a href="https://github.com/MenkeTechnologies/stryke-app" target="_blank" rel="noopener noreferrer">stryke-app</a></td><td>cdylib that provides <code>use App</code> to stryke scripts</td></tr>
+</tbody>
+</table>
+<h2 id="the-gap-it-closes">The gap it closes</h2>
+<p>The apps&#x27; command palette already had an <code>event</code> step (fires one action id, no args, no result) and a <code>stryke</code> step (runs a script with no handle back into the app). A script could not get a return value, read state, subscribe to events, or reach another app. The bus adds all four.</p>
+<h2 id="host-side-zgui-bridge">Host side: zgui-bridge</h2>
+<p>An app implements the <code>Handler</code> trait and calls <code>serve(app, handler)</code> once in <code>main</code>. That opens the endpoint, serves in the background, and returns an <code>Arc&lt;Bridge&gt;</code> the app keeps for pushing events.</p>
+<table>
+<thead><tr><th>Item</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>Handler::call(verb, args)</code></td><td>run a verb, return its value or an error string</td></tr>
+<tr><td><code>Handler::get(state)</code></td><td>answer a read-only state query</td></tr>
+<tr><td><code>Handler::surface()</code></td><td>the verbs/state/events manifest</td></tr>
+<tr><td><code>Handler::undo</code> / <code>Handler::rev</code></td><td>compensation and reversibility class; both optional</td></tr>
+<tr><td><code>Bridge::emit(event, payload)</code></td><td>push an event to every subscribed client</td></tr>
+</tbody>
+</table>
+<p>Implementation choices from the crate:</p>
+<ul>
+<li>No async runtime: a listener thread plus one thread per connection.</li>
+<li>Dependencies are <code>serde</code> and <code>serde_json</code>, plus <code>interprocess</code> on Windows only.</li>
+<li>Local only. The endpoint is <code>$XDG_RUNTIME_DIR/zgui/&lt;app&gt;.sock</code> on Linux, <code>$TMPDIR/zgui/&lt;app&gt;.sock</code> on macOS, <code>/tmp/zgui/&lt;app&gt;.sock</code> as fallback, and the named pipe <code>\\.\pipe\&lt;app&gt;.sock</code> on Windows. The directory is created <code>0700</code>, the socket <code>0600</code>, and a stale socket from a crashed run is removed before bind.</li>
+<li>Transport-agnostic: a Tauri app forwards <code>call</code>/<code>get</code> into the webview&#x27;s <code>ZGui.automation</code> surface; a JUCE app wires it over the C ABI.</li>
+</ul>
+<p>Verbs are an allow-list. Only what an app registers is reachable; there is no generic eval verb.</p>
+<h2 id="wire-protocol">Wire protocol</h2>
+<p>Newline-delimited JSON. <code>id</code> correlates a reply to its request; <code>sub</code> correlates pushed events to their subscription.</p>
+<pre><code>→ {&quot;t&quot;:&quot;call&quot;,&quot;id&quot;:1,&quot;verb&quot;:&quot;library.search&quot;,&quot;args&quot;:{&quot;q&quot;:&quot;graphene&quot;}}
+← {&quot;t&quot;:&quot;reply&quot;,&quot;id&quot;:1,&quot;ok&quot;:true,&quot;value&quot;:[ … ]}
+
+→ {&quot;t&quot;:&quot;sub&quot;,&quot;id&quot;:4,&quot;event&quot;:&quot;itemAdded&quot;}
+← {&quot;t&quot;:&quot;reply&quot;,&quot;id&quot;:4,&quot;ok&quot;:true}
+← {&quot;t&quot;:&quot;event&quot;,&quot;sub&quot;:4,&quot;event&quot;:&quot;itemAdded&quot;,&quot;payload&quot;:{ … }}
+
+← {&quot;t&quot;:&quot;reply&quot;,&quot;id&quot;:9,&quot;ok&quot;:false,&quot;error&quot;:&quot;no such verb: foo.bar&quot;}</code></pre>
+<p><code>get</code> reads a state query and <code>verbs</code> returns the typed manifest.</p>
+<h2 id="client-side-use-app">Client side: use App</h2>
+<p><code>stryke-app</code> is loaded in-process via dlopen on first <code>use App</code> and keeps one pooled connection per app, so there is no fork per call.</p>
+<pre class="language-stryke" data-lang="stryke"><code><span class="hl-comment">#!/usr/bin/env stryke</span>
+<span class="hl-kw">use</span> App
+
+p App::list()                                     <span class="hl-comment"># -&gt; [&quot;zcite&quot;, &quot;zreq&quot;, ...]</span>
+
+<span class="hl-kw">val</span> <span class="hl-var">$cite</span> = App::open(<span class="hl-string">&quot;zcite&quot;</span>)
+<span class="hl-kw">val</span> <span class="hl-var">@hits</span> = @{ <span class="hl-var">$cite</span><span class="hl-op">-&gt;</span>call(<span class="hl-string">&quot;library.search&quot;</span>, %{ q <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;graphene&quot;</span> }) }
+p <span class="hl-string">&quot;found ${\ scalar @hits}&quot;</span>
+
+<span class="hl-kw">val</span> <span class="hl-var">@sel</span> = @{ <span class="hl-var">$cite</span><span class="hl-op">-&gt;</span>get(<span class="hl-string">&quot;selection&quot;</span>) }
+
+<span class="hl-var">$cite</span><span class="hl-op">-&gt;</span><span class="hl-kw">sub</span>(<span class="hl-string">&quot;itemAdded&quot;</span>)
+<span class="hl-kw">for</span> <span class="hl-kw">val</span> <span class="hl-var">$ev</span> (@{ <span class="hl-var">$cite</span><span class="hl-op">-&gt;</span>poll() }) { p <span class="hl-string">&quot;added: ${ $ev-&gt;{payload}{title} }&quot;</span> }</code></pre>
+<p>The client reads until the matching <code>reply</code> and buffers interleaved <code>event</code> frames for <code>poll</code>. On a transport error it reconnects once and retries. <code>App::list()</code> enumerates <code>*.sock</code> files in the socket directory, so on Windows it returns an empty list; dialing a known name still works.</p>
+<h2 id="transactions">Transactions</h2>
+<p>A connection can open a transaction. Calls inside it are journaled, <code>abort</code> compensates them through <code>Handler::undo</code> in reverse order, and <code>commit</code> discards the journal. Each verb declares a reversibility class through <code>Handler::rev</code>, which applies only inside a transaction:</p>
+<table>
+<thead><tr><th><code>rev</code></th><th>Inside an open transaction</th></tr></thead>
+<tbody>
+<tr><td><code>&quot;inverse&quot;</code></td><td>runs, journaled, compensated on abort</td></tr>
+<tr><td><code>&quot;pure&quot;</code></td><td>runs, not journaled</td></tr>
+<tr><td><code>&quot;irreversible&quot;</code> (default)</td><td>rejected before it runs</td></tr>
+</tbody>
+</table>
+<p>Compensation is best-effort per step: every entry is attempted, and failures are returned in <code>failed[]</code> as <code>{seq, verb, error}</code>. <code>abort</code> is idempotent.</p>
+<p>Per-app journals cannot order steps across apps, because each app has its own <code>seq</code> clock. <code>stryke-app</code> adds a client-side ledger (<code>src/saga.rs</code>) with one saga-wide <code>seq</code>:</p>
+<pre class="language-stryke" data-lang="stryke"><code>{\ scalar @{ <span class="hl-var">$r</span><span class="hl-op">-&gt;</span>{failed} } }&quot;
+} <span class="hl-kw">else</span> {
+    <span class="hl-var">$txn</span><span class="hl-op">-&gt;</span>commit()
+}</code></pre>
+<p>The first call to each app sends <code>begin</code>, so the app&#x27;s own <code>rev</code> gate refuses an irreversible verb before it runs. <code>abort</code> walks the ledger in descending <code>seq</code>, sends one <code>undo</code> frame per step to the app that ran it, then sends <code>commit</code> to each app so its parallel journal is discarded without running inverses a second time. That host-side journal stays open if the orchestrating script dies mid-chain, so another process can still abort it.</p>
+<h2 id="design-versus-shipped">Design versus shipped</h2>
+<p>The RFC&#x27;s §6 sketches <code>$h-&gt;on($event, $fn)</code> callbacks; the shipped client uses <code>sub</code> plus explicit <code>poll</code>, which matches the RFC&#x27;s open-question proposal to drain events explicitly. The RFC describes <code>App::here()</code> as a direct in-process host callback with no socket; the shipped <code>App::here()</code> reads <code>$ZGUI_APP</code> and opens that app through the same socket path as <code>App::open</code>.</p>
+<p>The RFC lists 19 apps that call <code>zgui_bridge::serve</code> today, and one JUCE host (<code>zpwr-daw</code>) through a C++ port of the transport. It records the novelty claim as a combination, &quot;none found,&quot; low confidence.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="stryke-fleet-parallel-expect-playbooks.html"><span class="nav-label">Older</span><span class="nav-title">Parallel Expect Playbooks with stryke-fleet</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="fusevm-shared-bytecode-vm.html"><span class="nav-label">Newer</span><span class="nav-title">fusevm, the Bytecode VM Under stryke and zshrs</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

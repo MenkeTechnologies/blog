@@ -88,6 +88,97 @@ cargo add fusevm                  &lt;span class=&quot;hl-comment&quot;&gt;# int
 </content>
   </entry>
   <entry>
+    <title>The GUI Automation Bus — Driving GUI Apps from stryke by Verb Name</title>
+    <link href="https://menketechnologies.github.io/blog/posts/gui-automation-bus-stryke-app.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/gui-automation-bus-stryke-app.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>How zgui-bridge and stryke-app let a stryke script call an app&#x27;s verbs, read its state, subscribe to its events, and roll back a chain of calls across several apps.</summary>
+    <category term="stryke"/>
+    <category term="automation"/>
+    <category term="ipc"/>
+    <category term="gui"/>
+    <content type="html">&lt;p&gt;The GUI Automation Bus lets a stryke script call a GUI app&amp;#x27;s named verbs, read its state, and subscribe to its events, either from inside the app or from a terminal. It is semantic, not pixel-level: where &lt;code&gt;stryke-gui&lt;/code&gt; moves the mouse, the bus calls &lt;code&gt;library.search&lt;/code&gt; and gets rows back.&lt;/p&gt;
+&lt;p&gt;Three pieces:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Piece&lt;/th&gt;&lt;th&gt;Role&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;docs/GUI_AUTOMATION_BUS.md&lt;/code&gt; in &lt;a href=&quot;https://github.com/MenkeTechnologies/MenkeTechnologiesMeta&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;MenkeTechnologiesMeta&lt;/a&gt;&lt;/td&gt;&lt;td&gt;Design doc (RFC), status: shipped (Track A)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zgui-bridge&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Rust crate each app links to host the bus endpoint&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/stryke-app&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;stryke-app&lt;/a&gt;&lt;/td&gt;&lt;td&gt;cdylib that provides &lt;code&gt;use App&lt;/code&gt; to stryke scripts&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h2 id=&quot;the-gap-it-closes&quot;&gt;The gap it closes&lt;/h2&gt;
+&lt;p&gt;The apps&amp;#x27; command palette already had an &lt;code&gt;event&lt;/code&gt; step (fires one action id, no args, no result) and a &lt;code&gt;stryke&lt;/code&gt; step (runs a script with no handle back into the app). A script could not get a return value, read state, subscribe to events, or reach another app. The bus adds all four.&lt;/p&gt;
+&lt;h2 id=&quot;host-side-zgui-bridge&quot;&gt;Host side: zgui-bridge&lt;/h2&gt;
+&lt;p&gt;An app implements the &lt;code&gt;Handler&lt;/code&gt; trait and calls &lt;code&gt;serve(app, handler)&lt;/code&gt; once in &lt;code&gt;main&lt;/code&gt;. That opens the endpoint, serves in the background, and returns an &lt;code&gt;Arc&amp;lt;Bridge&amp;gt;&lt;/code&gt; the app keeps for pushing events.&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Item&lt;/th&gt;&lt;th&gt;Purpose&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Handler::call(verb, args)&lt;/code&gt;&lt;/td&gt;&lt;td&gt;run a verb, return its value or an error string&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Handler::get(state)&lt;/code&gt;&lt;/td&gt;&lt;td&gt;answer a read-only state query&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Handler::surface()&lt;/code&gt;&lt;/td&gt;&lt;td&gt;the verbs/state/events manifest&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Handler::undo&lt;/code&gt; / &lt;code&gt;Handler::rev&lt;/code&gt;&lt;/td&gt;&lt;td&gt;compensation and reversibility class; both optional&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Bridge::emit(event, payload)&lt;/code&gt;&lt;/td&gt;&lt;td&gt;push an event to every subscribed client&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;Implementation choices from the crate:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;No async runtime: a listener thread plus one thread per connection.&lt;/li&gt;
+&lt;li&gt;Dependencies are &lt;code&gt;serde&lt;/code&gt; and &lt;code&gt;serde_json&lt;/code&gt;, plus &lt;code&gt;interprocess&lt;/code&gt; on Windows only.&lt;/li&gt;
+&lt;li&gt;Local only. The endpoint is &lt;code&gt;$XDG_RUNTIME_DIR/zgui/&amp;lt;app&amp;gt;.sock&lt;/code&gt; on Linux, &lt;code&gt;$TMPDIR/zgui/&amp;lt;app&amp;gt;.sock&lt;/code&gt; on macOS, &lt;code&gt;/tmp/zgui/&amp;lt;app&amp;gt;.sock&lt;/code&gt; as fallback, and the named pipe &lt;code&gt;\\.\pipe\&amp;lt;app&amp;gt;.sock&lt;/code&gt; on Windows. The directory is created &lt;code&gt;0700&lt;/code&gt;, the socket &lt;code&gt;0600&lt;/code&gt;, and a stale socket from a crashed run is removed before bind.&lt;/li&gt;
+&lt;li&gt;Transport-agnostic: a Tauri app forwards &lt;code&gt;call&lt;/code&gt;/&lt;code&gt;get&lt;/code&gt; into the webview&amp;#x27;s &lt;code&gt;ZGui.automation&lt;/code&gt; surface; a JUCE app wires it over the C ABI.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Verbs are an allow-list. Only what an app registers is reachable; there is no generic eval verb.&lt;/p&gt;
+&lt;h2 id=&quot;wire-protocol&quot;&gt;Wire protocol&lt;/h2&gt;
+&lt;p&gt;Newline-delimited JSON. &lt;code&gt;id&lt;/code&gt; correlates a reply to its request; &lt;code&gt;sub&lt;/code&gt; correlates pushed events to their subscription.&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;→ {&amp;quot;t&amp;quot;:&amp;quot;call&amp;quot;,&amp;quot;id&amp;quot;:1,&amp;quot;verb&amp;quot;:&amp;quot;library.search&amp;quot;,&amp;quot;args&amp;quot;:{&amp;quot;q&amp;quot;:&amp;quot;graphene&amp;quot;}}
+← {&amp;quot;t&amp;quot;:&amp;quot;reply&amp;quot;,&amp;quot;id&amp;quot;:1,&amp;quot;ok&amp;quot;:true,&amp;quot;value&amp;quot;:[ … ]}
+
+→ {&amp;quot;t&amp;quot;:&amp;quot;sub&amp;quot;,&amp;quot;id&amp;quot;:4,&amp;quot;event&amp;quot;:&amp;quot;itemAdded&amp;quot;}
+← {&amp;quot;t&amp;quot;:&amp;quot;reply&amp;quot;,&amp;quot;id&amp;quot;:4,&amp;quot;ok&amp;quot;:true}
+← {&amp;quot;t&amp;quot;:&amp;quot;event&amp;quot;,&amp;quot;sub&amp;quot;:4,&amp;quot;event&amp;quot;:&amp;quot;itemAdded&amp;quot;,&amp;quot;payload&amp;quot;:{ … }}
+
+← {&amp;quot;t&amp;quot;:&amp;quot;reply&amp;quot;,&amp;quot;id&amp;quot;:9,&amp;quot;ok&amp;quot;:false,&amp;quot;error&amp;quot;:&amp;quot;no such verb: foo.bar&amp;quot;}&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;get&lt;/code&gt; reads a state query and &lt;code&gt;verbs&lt;/code&gt; returns the typed manifest.&lt;/p&gt;
+&lt;h2 id=&quot;client-side-use-app&quot;&gt;Client side: use App&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;stryke-app&lt;/code&gt; is loaded in-process via dlopen on first &lt;code&gt;use App&lt;/code&gt; and keeps one pooled connection per app, so there is no fork per call.&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;span class=&quot;hl-comment&quot;&gt;#!/usr/bin/env stryke&lt;/span&gt;
+&lt;span class=&quot;hl-kw&quot;&gt;use&lt;/span&gt; App
+
+p App::list()                                     &lt;span class=&quot;hl-comment&quot;&gt;# -&amp;gt; [&amp;quot;zcite&amp;quot;, &amp;quot;zreq&amp;quot;, ...]&lt;/span&gt;
+
+&lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$cite&lt;/span&gt; = App::open(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;zcite&amp;quot;&lt;/span&gt;)
+&lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;@hits&lt;/span&gt; = @{ &lt;span class=&quot;hl-var&quot;&gt;$cite&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;call(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;library.search&amp;quot;&lt;/span&gt;, %{ q &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;graphene&amp;quot;&lt;/span&gt; }) }
+p &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;found ${\ scalar @hits}&amp;quot;&lt;/span&gt;
+
+&lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;@sel&lt;/span&gt; = @{ &lt;span class=&quot;hl-var&quot;&gt;$cite&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;get(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;selection&amp;quot;&lt;/span&gt;) }
+
+&lt;span class=&quot;hl-var&quot;&gt;$cite&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;hl-kw&quot;&gt;sub&lt;/span&gt;(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;itemAdded&amp;quot;&lt;/span&gt;)
+&lt;span class=&quot;hl-kw&quot;&gt;for&lt;/span&gt; &lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$ev&lt;/span&gt; (@{ &lt;span class=&quot;hl-var&quot;&gt;$cite&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;poll() }) { p &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;added: ${ $ev-&amp;gt;{payload}{title} }&amp;quot;&lt;/span&gt; }&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The client reads until the matching &lt;code&gt;reply&lt;/code&gt; and buffers interleaved &lt;code&gt;event&lt;/code&gt; frames for &lt;code&gt;poll&lt;/code&gt;. On a transport error it reconnects once and retries. &lt;code&gt;App::list()&lt;/code&gt; enumerates &lt;code&gt;*.sock&lt;/code&gt; files in the socket directory, so on Windows it returns an empty list; dialing a known name still works.&lt;/p&gt;
+&lt;h2 id=&quot;transactions&quot;&gt;Transactions&lt;/h2&gt;
+&lt;p&gt;A connection can open a transaction. Calls inside it are journaled, &lt;code&gt;abort&lt;/code&gt; compensates them through &lt;code&gt;Handler::undo&lt;/code&gt; in reverse order, and &lt;code&gt;commit&lt;/code&gt; discards the journal. Each verb declares a reversibility class through &lt;code&gt;Handler::rev&lt;/code&gt;, which applies only inside a transaction:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;&lt;code&gt;rev&lt;/code&gt;&lt;/th&gt;&lt;th&gt;Inside an open transaction&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;&amp;quot;inverse&amp;quot;&lt;/code&gt;&lt;/td&gt;&lt;td&gt;runs, journaled, compensated on abort&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;&amp;quot;pure&amp;quot;&lt;/code&gt;&lt;/td&gt;&lt;td&gt;runs, not journaled&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;&amp;quot;irreversible&amp;quot;&lt;/code&gt; (default)&lt;/td&gt;&lt;td&gt;rejected before it runs&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;Compensation is best-effort per step: every entry is attempted, and failures are returned in &lt;code&gt;failed[]&lt;/code&gt; as &lt;code&gt;{seq, verb, error}&lt;/code&gt;. &lt;code&gt;abort&lt;/code&gt; is idempotent.&lt;/p&gt;
+&lt;p&gt;Per-app journals cannot order steps across apps, because each app has its own &lt;code&gt;seq&lt;/code&gt; clock. &lt;code&gt;stryke-app&lt;/code&gt; adds a client-side ledger (&lt;code&gt;src/saga.rs&lt;/code&gt;) with one saga-wide &lt;code&gt;seq&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;{\ scalar @{ &lt;span class=&quot;hl-var&quot;&gt;$r&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{failed} } }&amp;quot;
+} &lt;span class=&quot;hl-kw&quot;&gt;else&lt;/span&gt; {
+    &lt;span class=&quot;hl-var&quot;&gt;$txn&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;commit()
+}&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The first call to each app sends &lt;code&gt;begin&lt;/code&gt;, so the app&amp;#x27;s own &lt;code&gt;rev&lt;/code&gt; gate refuses an irreversible verb before it runs. &lt;code&gt;abort&lt;/code&gt; walks the ledger in descending &lt;code&gt;seq&lt;/code&gt;, sends one &lt;code&gt;undo&lt;/code&gt; frame per step to the app that ran it, then sends &lt;code&gt;commit&lt;/code&gt; to each app so its parallel journal is discarded without running inverses a second time. That host-side journal stays open if the orchestrating script dies mid-chain, so another process can still abort it.&lt;/p&gt;
+&lt;h2 id=&quot;design-versus-shipped&quot;&gt;Design versus shipped&lt;/h2&gt;
+&lt;p&gt;The RFC&amp;#x27;s §6 sketches &lt;code&gt;$h-&amp;gt;on($event, $fn)&lt;/code&gt; callbacks; the shipped client uses &lt;code&gt;sub&lt;/code&gt; plus explicit &lt;code&gt;poll&lt;/code&gt;, which matches the RFC&amp;#x27;s open-question proposal to drain events explicitly. The RFC describes &lt;code&gt;App::here()&lt;/code&gt; as a direct in-process host callback with no socket; the shipped &lt;code&gt;App::here()&lt;/code&gt; reads &lt;code&gt;$ZGUI_APP&lt;/code&gt; and opens that app through the same socket path as &lt;code&gt;App::open&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;The RFC lists 19 apps that call &lt;code&gt;zgui_bridge::serve&lt;/code&gt; today, and one JUCE host (&lt;code&gt;zpwr-daw&lt;/code&gt;) through a C++ port of the transport. It records the novelty claim as a combination, &amp;quot;none found,&amp;quot; low confidence.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
     <title>Parallel Expect Playbooks with stryke-fleet</title>
     <link href="https://menketechnologies.github.io/blog/posts/stryke-fleet-parallel-expect-playbooks.html"/>
     <id>https://menketechnologies.github.io/blog/posts/stryke-fleet-parallel-expect-playbooks.html</id>
