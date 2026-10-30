@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="What the stryke web generator and runtime ship today, and which parts of the design doc are still targets.">
+  <title>stryke web — A Rails-Shaped Framework for stryke — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/stryke-web-rails-style-framework.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>stryke web — A Rails-Shaped Framework for stryke</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 4 min read <span class="sep">·</span> <a class="post-tag" href="../tags/stryke.html">#stryke</a> <a class="post-tag" href="../tags/web.html">#web</a> <a class="post-tag" href="../tags/framework.html">#framework</a> <a class="post-tag" href="../tags/rust.html">#rust</a></span></p>
+      <article class="tutorial-section post-body">
+<p>stryke web is the web framework for <a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">strykelang</a>. It has two halves: a Rust CLI, <code>s_web</code>, that generates <code>.stk</code> source for a new app, and a set of <code>web_*</code> runtime builtins inside the stryke interpreter that serve it. The design doc is <code>docs/WEB_FRAMEWORK.md</code>; the generator reference is <code>stryke_web/README.md</code>.</p>
+<p>The design doc marks its own status: Phase 0 shipped, most of Phase 1 shipped, Phase 2 mostly deferred, Phase 3 not started. This post follows that split.</p>
+<h2 id="architecture">Architecture</h2>
+<table>
+<thead><tr><th>Layer</th><th>Language</th><th>Location</th></tr></thead>
+<tbody>
+<tr><td>Generator CLI (<code>s_web new</code>, <code>g</code>, <code>s</code>, <code>db</code>, <code>routes</code>)</td><td>Rust</td><td><code>stryke_web/</code></td></tr>
+<tr><td>Generated app code (<code>config/routes.stk</code>, controllers, models)</td><td>stryke</td><td>the user&#x27;s app directory</td></tr>
+<tr><td>Framework runtime (<code>web_route</code>, <code>web_render</code>, ORM, migrations)</td><td>Rust builtins</td><td><code>strykelang/web.rs</code>, <code>strykelang/web_orm.rs</code></td></tr>
+</tbody>
+</table>
+<p>The <code>stryke_web</code> crate opts out of the parent workspace with its own <code>[workspace]</code> table, so it builds independently of the interpreter. Its only runtime dependencies are <code>clap</code> and <code>heck</code>.</p>
+<h2 id="shipped-the-generator">Shipped: the generator</h2>
+<pre class="language-sh" data-lang="sh"><code>s_web new myblog
+cd myblog
+s_web g scaffold Post title:string body:text published:bool
+<span class="hl-comment"># routes.stk — add `web_resources &quot;posts&quot;`</span>
+s_web db migrate
+bin/server
+<span class="hl-comment"># open http://localhost:3000/posts</span></code></pre>
+<p><code>s_web g scaffold</code> writes a model, a migration, a 7-action controller, and 5 ERB views. The generated controller calls model class methods that delegate to the <code>web_model_*</code> builtins:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p>Other generators: <code>controller</code>, <code>model</code>, <code>migration</code>, <code>app PRESET</code>, <code>auth</code>, <code>admin</code>, <code>api</code>, <code>mailer</code>, <code>job</code>, <code>channel</code>, <code>docker</code>, <code>ci</code>, <code>pwa</code>. <code>s_web new</code> also takes flags that run several of these at once:</p>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<p>Presets include <code>blog</code>, <code>ecommerce</code>, <code>saas</code>, <code>cms</code>, <code>forum</code>, <code>crm</code>, <code>helpdesk</code> and others. Themes include <code>simple</code>, <code>dark</code>, <code>pico</code>, <code>bootstrap</code>, <code>tailwind</code>, and four CSS-only neon themes (<code>cyberpunk</code>, <code>synthwave</code>, <code>terminal</code>, <code>matrix</code>). <code>--docker</code>, <code>--ci</code>, and <code>--pwa</code> add a multi-stage Dockerfile, a GitHub Actions workflow that runs migrate + boot + a <code>/health</code> smoke check, and a PWA manifest plus service worker.</p>
+<h2 id="shipped-the-runtime">Shipped: the runtime</h2>
+<p>Routing is a set of builtins called from <code>config/routes.stk</code>:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p>The runtime surface, grouped:</p>
+<ul>
+<li><strong>Request/response</strong>: <code>web_params</code>, <code>web_request</code>, <code>web_render</code> (html/text/json/template), <code>web_redirect</code>, <code>web_set_header</code>, <code>web_status</code>. An action that calls neither <code>web_render</code> nor <code>web_redirect</code> renders <code>app/views/{resource}/{action}.html.erb</code>.</li>
+<li><strong>Templates</strong>: ERB with <code>&lt;%= %&gt;</code>, <code>&lt;% %&gt;</code>, <code>&lt;%# %&gt;</code>, <code>&lt;%- -%&gt;</code>, layouts, and <code>web_render_partial</code>. Control structures can span tags because the engine compiles all segments into one stryke program before running it.</li>
+<li><strong>Data</strong>: SQLite by default (<code>web_db_connect</code>, <code>web_db_query</code>, <code>web_db_execute</code>), the <code>web_model_*</code> CRUD set, pagination, LIKE search, soft delete, counter caches, single-IN-query eager loading (<code>web_model_with</code>), and transactions.</li>
+<li><strong>Migrations</strong>: <code>web_create_table</code>, <code>web_add_column</code>, <code>web_remove_column</code>, <code>web_drop_table</code>, <code>web_migrate</code>/<code>web_rollback</code>, tracked in <code>schema_migrations</code>.</li>
+<li><strong>Jobs</strong>: database-backed queue (<code>web_jobs_init</code>, <code>web_job_enqueue</code>/<code>dequeue</code>/<code>complete</code>/<code>fail</code>).</li>
+<li><strong>Security and auth</strong>: CSRF meta tag, <code>web_security_headers</code>, <code>web_permit</code> strong params, cookie sessions and flash, JWT (HS256), TOTP, token-bucket rate limiting, signed time-limited tokens, <code>web_can</code>.</li>
+<li><strong>APIs</strong>: <code>/openapi.json</code>, Swagger UI at <code>/docs</code>, and Redoc at <code>/docs/redoc</code> are served from the live route table with no app code. JSON:API envelope helpers and <code>web_bearer_token</code> are included.</li>
+<li><strong>Streaming</strong>: SSE via <code>web_sse_event</code> and <code>web_render_stream</code>.</li>
+</ul>
+<p><code>s_web build</code> generates a Rust wrapper crate that embeds every <code>.stk</code> file with <code>include_str!</code>; <code>cargo build --release</code> inside it produces one binary containing the framework, the app, and statically linked SQLite. The README reports one such build at 136 MB on macOS arm64.</p>
+<h2 id="shipped-behavior-that-differs-from-the-design-doc">Shipped behavior that differs from the design doc</h2>
+<p>Some shipped pieces are simpler than the doc&#x27;s target form:</p>
+<table>
+<thead><tr><th>Area</th><th>Design doc target</th><th>Shipped</th></tr></thead>
+<tbody>
+<tr><td>Template output</td><td>originally <code>#{ expr }</code>, compiled AOT via Cranelift</td><td>ERB <code>&lt;%= %&gt;</code>, compiled to a stryke program at request time</td></tr>
+<tr><td>Routing DSL</td><td><code>route :GET, &quot;/&quot;, home#index</code>, <code>resources :posts</code></td><td><code>web_route</code> / <code>web_resources</code> / <code>web_root</code> builtins</td></tr>
+<tr><td>Password storage</td><td>Argon2id</td><td>SHA-256 + salt (<code>web_password_hash</code>)</td></tr>
+<tr><td>JSON</td><td>simd-json</td><td><code>serde_json</code></td></tr>
+<tr><td>ORM</td><td>joins, scopes, callbacks</td><td>single-table chains; joins/scopes pending</td></tr>
+</tbody>
+</table>
+<p>The template change is recorded in the doc&#x27;s Resolved Decisions (2026-05-01): ERB replaced <code>#{}</code> for visual parity with Rails.</p>
+<h2 id="not-shipped-yet">Not shipped yet</h2>
+<p>From the doc&#x27;s phase list, deferred or not started:</p>
+<ul>
+<li>HTTP/2 via <code>h2</code> and TLS via <code>rustls</code>.</li>
+<li>WebSockets and the Channel abstraction (generators scaffold channel stubs only).</li>
+<li>glommio + io_uring thread-per-core runtime, per-core sharding.</li>
+<li>Mailer runtime (SMTP); the generator writes the structure.</li>
+<li>Polished hot reload, TechEmpower harness, public benchmark dashboard.</li>
+<li>Phase 3: HTTP/3 default-on, kTLS, custom SIMD HTTP parser, wasm32-wasi edge target.</li>
+</ul>
+<p><code>s_web console</code> is marked pending a stryke <code>--repl</code> flag.</p>
+<h2 id="performance-targets-not-measurements">Performance: targets, not measurements</h2>
+<p>The design doc has a performance table: 500k req/s plaintext for Phase 0, rising to 6M+ for Phase 3, plus cold-start and memory targets. These are design targets. For Phase 0 the doc says the number is &quot;still subject to TechEmpower-style validation&quot;, and the Phase 1 targets are &quot;pending Phase 2 perf work.&quot; No TechEmpower results are published in the repo. Local benchmarks run through <code>s bench</code>.</p>
+<p>The one wall-clock figure in the generator README is about scaffolding, not serving: about 0.45 s to generate and migrate the <code>everything</code> preset.</p>
+<p>Source: <code>docs/WEB_FRAMEWORK.md</code>, <code>stryke_web/README.md</code>, and <code>strykelang/web.rs</code> in <a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">strykelang</a>.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="welcome.html"><span class="nav-label">Older</span><span class="nav-title">Welcome</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="stryke-pipelines-and-parallel-primitives.html"><span class="nav-label">Newer</span><span class="nav-title">Pipelines, Threading, and Parallel Primitives in stryke</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

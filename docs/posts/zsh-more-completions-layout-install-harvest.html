@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="How the zsh-more-completions corpus is split across directories, how its plugin file wires them into fpath, and how new completion files are harvested and checked.">
+  <title>zsh-more-completions, Layout, Install and How Completions Get In — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/zsh-more-completions-layout-install-harvest.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>zsh-more-completions, Layout, Install and How Completions Get In</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 4 min read <span class="sep">·</span> <a class="post-tag" href="../tags/zsh-more-completions.html">#zsh-more-completions</a> <a class="post-tag" href="../tags/zsh.html">#zsh</a> <a class="post-tag" href="../tags/completion.html">#completion</a> <a class="post-tag" href="../tags/compsys.html">#compsys</a></span></p>
+      <article class="tutorial-section post-body">
+<p><a href="https://github.com/MenkeTechnologies/zsh-more-completions" target="_blank" rel="noopener noreferrer">zsh-more-completions</a> is a zsh plugin made of <code>#compdef</code> completion files for compsys. The README says most files were first generated from <code>--help</code> output, man pages and web research, then cleaned and updated by hand, and that many were written by hand from the start.</p>
+<p>The README also treats the corpus as reference material. Each <code>_command</code> file uses the same schema: a <code>#compdef</code> header, then <code>_arguments</code> / <code>_describe</code> blocks that list subcommands, flags and arguments with descriptions. You can read a command&#x27;s options from its file without installing the command.</p>
+<h2 id="size">Size</h2>
+<p>All counts below come from <code>origin/main</code> at <code>c66e5683dd</code>. The repo has a stats script, <code>scripts/print-repo-stats.zsh</code>, that counts <code>_*</code> files with <code>find -maxdepth 1 -type f</code> in each completion directory. This tree query counts the same files without a checkout:</p>
+<pre class="language-sh" data-lang="sh"><code>git ls-tree -r --name-only origin/main \
+  | perl -ne <span class="hl-string">&#x27;print &quot;$1\n&quot; if m{^([^/]+)/_[^/]*$}&#x27;</span> | sort | uniq -c</code></pre>
+<table>
+<thead><tr><th>Directory</th><th><code>_*</code> files</th><th>Purpose (README)</th></tr></thead>
+<tbody>
+<tr><td><code>src/</code></td><td>8,360</td><td>main completions</td></tr>
+<tr><td><code>more_src/</code></td><td>13,128</td><td>additional (0-9, a-c)</td></tr>
+<tr><td><code>more_src2/</code></td><td>4,497</td><td>additional (d-g)</td></tr>
+<tr><td><code>more_src3/</code></td><td>3,788</td><td>additional (h-l)</td></tr>
+<tr><td><code>more_src4/</code></td><td>5,244</td><td>additional (m-p)</td></tr>
+<tr><td><code>more_src5/</code></td><td>3,717</td><td>additional (q-s)</td></tr>
+<tr><td><code>more_src6/</code></td><td>3,973</td><td>additional (t-z)</td></tr>
+<tr><td><code>more_src7/</code></td><td>100</td><td>automated generation</td></tr>
+<tr><td><code>more_src8/</code></td><td>100</td><td>automated generation</td></tr>
+<tr><td><code>man_src/</code></td><td>3,398</td><td>parsed from man pages</td></tr>
+<tr><td><code>override_src/</code></td><td>22</td><td>overrides, prepended to <code>fpath</code></td></tr>
+<tr><td><code>architecture_src/</code></td><td>1,067</td><td>cross-architecture toolchains</td></tr>
+<tr><td><strong>total</strong></td><td><strong>47,394</strong></td><td></td></tr>
+</tbody>
+</table>
+<p>The README headline says 47,398. It also says counts change constantly and should never be edited by hand, and points to the stats script for live numbers.</p>
+<p><code>architecture_src/</code> holds target-prefixed toolchain binaries such as <code>_aarch64-alpine-linux-musl-gcc</code>. <code>override_src/</code> is a short list (<code>_git</code>, <code>_curl</code>, <code>_whois</code>, <code>_ztmux</code>, <code>_zshrs</code> and others) meant to win over completions found elsewhere on <code>fpath</code>.</p>
+<h2 id="how-the-plugin-loads">How the plugin loads</h2>
+<p><code>zsh-more-completions.plugin.zsh</code> is 18 lines. It does not autoload anything and does not call <code>compinit</code>. It only edits <code>fpath</code>:</p>
+<pre class="language-zsh" data-lang="zsh"><code> ... <span class="hl-string">&quot;$1/man_src&quot;</span> <span class="hl-string">&quot;$1/architecture_src&quot;</span>)</code></pre>
+<p><code>override_src</code> is prepended. Every other directory is appended, after the system completion directories, so a completion shipped with zsh or the OS still wins over the plugin&#x27;s copy. Each directory is added only if it is not already on <code>fpath</code>.</p>
+<h2 id="installing">Installing</h2>
+<h3 id="zinit-readme-recommended">Zinit (README: recommended)</h3>
+<pre class="language-zsh" data-lang="zsh"><code></code></pre>
+<p><code>nocompletions</code> stops zinit from symlinking every file into <code>~/.zinit/completions</code>. The plugin&#x27;s own <code>fpath</code> ordering then applies, so <code>override_src</code> stays first and system completions stay ahead of the rest.</p>
+<h3 id="oh-my-zsh">Oh My Zsh</h3>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<p>Add <code>zsh-more-completions</code> to <code>plugins</code>. OMZ adds only the plugin root to <code>fpath</code>, so the README gives a loop to run before OMZ calls <code>compinit</code>. It adds each <code>*src</code> directory, putting <code>override</code> directories first:</p>
+<pre class="language-zsh" data-lang="zsh"><code>   <span class="hl-kw">if</span> [[ -d <span class="hl-string">&quot;$dir&quot;</span> ]]; <span class="hl-kw">then</span>
+                <span class="hl-kw">if</span> [[ -z <span class="hl-var">${fpath</span>[(r)<span class="hl-var">$dir</span>]} ]];<span class="hl-kw">then</span>
+                    <span class="hl-kw">if</span> [[ <span class="hl-var">$dir</span> = *override* ]]; <span class="hl-kw">then</span>
+                        fpath=(<span class="hl-var">$dir</span> <span class="hl-var">$fpath</span>)
+                    <span class="hl-kw">else</span>
+                        fpath=(<span class="hl-var">$fpath</span> <span class="hl-var">$dir</span>)
+                    <span class="hl-kw">fi</span>
+                <span class="hl-kw">fi</span>
+            <span class="hl-kw">fi</span>
+        <span class="hl-kw">done</span>
+    <span class="hl-kw">fi</span>
+<span class="hl-kw">done</span></code></pre>
+<p>A comment in the plugin file says that under OMZ, <code>compinit</code> has to run twice: once in OMZ, and once after the plugin file is sourced.</p>
+<h3 id="manual">Manual</h3>
+<p>Clone the repo and copy the <code>_*</code> files from the source directories to a directory on your <code>fpath</code>.</p>
+<h3 id="then">Then</h3>
+<pre class="language-zsh" data-lang="zsh"><code></code></pre>
+<p>The README suggests <code>compinit -C</code> for faster startup. It skips the security check and loads the cached <code>~/.zcompdump</code>.</p>
+<h2 id="how-completions-are-added">How completions are added</h2>
+<p>The <code>scripts/</code> directory holds the harvesters:</p>
+<ul>
+<li><code>harvest-apt-completions.py</code></li>
+<li><code>harvest-brew-completions.py</code></li>
+<li><code>harvest-crates-completions.py</code></li>
+<li><code>harvest-gh-releases.py</code></li>
+<li><code>harvest-nix-completions.py</code></li>
+<li><code>harvest-web-completions.py</code></li>
+</ul>
+<p>The Homebrew harvester&#x27;s docstring gives the pipeline for each formula:</p>
+<ol>
+<li>Skip if <code>_&lt;formula&gt;</code> is already in <code>src/</code> or <code>more_src/</code>, or is in <code>blacklist.txt</code>.</li>
+<li>Run <code>brew fetch --quiet &lt;formula&gt;</code> to pull the bottle without installing it.</li>
+<li>Stream-extract <code>share/zsh/site-functions/_*</code> from the tarball.</li>
+<li>Dedup, validate with <code>zsh -nf</code>, write headers and body to <code>more_src/_&lt;stem&gt;</code>, and add the stem to the blacklist.</li>
+</ol>
+<p><code>blacklist.txt</code> (51,623 lines at this commit) is the dedup ledger. Once a command name is covered, harvesters skip it. The APT harvester loads and merges the same file.</p>
+<p>The README&#x27;s harvest list goes past package managers: Nix, Homebrew, APT, Fedora, Alpine, FreeBSD, Kali, crates.io, npm, and source-level work on scientific and infrastructure toolkits. For many of those, it says flag tables were read from each tool&#x27;s <code>usage()</code> function, argparse setup or man page source.</p>
+<p>Hand-written files follow the same rules. The files in <code>override_src/</code> show the format, for example <code>_whois</code>:</p>
+<pre class="language-zsh" data-lang="zsh"><code></code></pre>
+<h2 id="tests">Tests</h2>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<p>GitHub Actions runs the same command on Ubuntu. At this commit, <code>tests/</code> has 22 <code>.zsh</code> files with 22,642 <code>@test</code> entries (<code>git grep -h &#x27;^@test&#x27; origin/main -- &#x27;tests/*.zsh&#x27; | wc -l</code>). Among the checks:</p>
+<ul>
+<li>every <code>override_src</code> file starts with <code>#compdef</code>, and every <code>src</code> file starts with <code>#compdef</code> or <code>#autoload</code> (<code>t-headers.zsh</code>)</li>
+<li>conventions such as <code>_files</code> for filename arguments, bracketed option descriptions, and combined short and long option specs (<code>t-conventions.zsh</code>)</li>
+<li><code>blacklist.txt</code> exists, is non-empty and has no duplicate lines, and the CI workflow contract holds (<code>t-repo-invariants.zsh</code>)</li>
+</ul>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="zshrs-architecture-overview.html"><span class="nav-label">Older</span><span class="nav-title">Inside zshrs - A zsh Port in Rust Split Into Ported Code and Extensions</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="zpwr-verb-dispatcher-terminal-environment.html"><span class="nav-label">Newer</span><span class="nav-title">zpwr, a Terminal Environment Behind One Verb Dispatcher</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

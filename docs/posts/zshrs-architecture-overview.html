@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="How zshrs is laid out — a mechanically enforced 1:1 port of zsh&#x27;s C source, a separate extensions tree, and a fusevm bytecode core underneath both.">
+  <title>Inside zshrs - A zsh Port in Rust Split Into Ported Code and Extensions — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/zshrs-architecture-overview.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>Inside zshrs - A zsh Port in Rust Split Into Ported Code and Extensions</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 3 min read <span class="sep">·</span> <a class="post-tag" href="../tags/zshrs.html">#zshrs</a> <a class="post-tag" href="../tags/rust.html">#rust</a> <a class="post-tag" href="../tags/shells.html">#shells</a> <a class="post-tag" href="../tags/architecture.html">#architecture</a></span></p>
+      <article class="tutorial-section post-body">
+<p><a href="https://github.com/MenkeTechnologies/zshrs" target="_blank" rel="noopener noreferrer">zshrs</a> is a drop-in zsh replacement written in Rust. Every command — interactive, script, function, sourced file — is compiled to <a href="https://github.com/MenkeTechnologies/fusevm" target="_blank" rel="noopener noreferrer">fusevm</a> bytecode rather than walked as an AST, and compiled chunks are persisted across processes in rkyv images.</p>
+<p>This post covers the layout of the codebase and the rules that keep it honest. A follow-up covers the compile pipeline and cache.</p>
+<h2 id="workspace">Workspace</h2>
+<p>The repository is a 4-crate workspace:</p>
+<table>
+<thead><tr><th>Crate</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>zshrs</code></td><td>The runtime</td></tr>
+<tr><td><code>zshrs-daemon</code></td><td>IPC, HTTP, fsnotify, cache maintenance</td></tr>
+<tr><td><code>znative</code></td><td>Published SDK for native Rust plugins</td></tr>
+<tr><td><code>zshrs-runtime</code></td><td>Emits <code>libzsh.a</code> for AOT linking, kept separate so <code>cargo install zshrs</code> does not build it</td></tr>
+</tbody>
+</table>
+<p>Shipped binaries live in <code>bins/</code>: <code>zshrs</code> (always built), <code>zshrs-recorder</code> (<code>--features recorder</code>) and <code>zd</code> (<code>--features zd</code>).</p>
+<h2 id="ported-code-vs-extensions">Ported code vs extensions</h2>
+<p>The runtime source is divided into directories with different rules:</p>
+<table>
+<thead><tr><th>Directory</th><th>Rule</th></tr></thead>
+<tbody>
+<tr><td><code>src/ported/</code></td><td>Strict 1:1 port. Every <code>.rs</code> mirrors a real upstream <code>Src/&lt;x&gt;.c</code>; every top-level <code>fn</code> carries <code>/// Port of &lt;cname&gt;() from Src/&lt;file&gt;.c:NNNN</code>; no invented helpers; file set frozen.</td></tr>
+<tr><td><code>src/compsys/ported/</code></td><td>1:1 mirror of zsh&#x27;s <code>Completion/</code> tree. Engine functions are ported to Rust; end-user completers are copied as-is and dispatched through a <code>_call_function</code> bridge.</td></tr>
+<tr><td><code>src/extensions/</code></td><td>Features zsh C does not have. Must not duplicate or shadow a port.</td></tr>
+<tr><td><code>src/recorder/</code></td><td>Feature-gated; every symbol is <code>#[cfg(feature = &quot;recorder&quot;)]</code>.</td></tr>
+</tbody>
+</table>
+<p>The boundary is enforced by a test, <code>tests/port_purity.rs</code>, not by convention. The lexer and parser are direct ports of <code>Src/lex.c</code> and <code>Src/parse.c</code>, and zsh&#x27;s AST shape (<code>ZshProgram → ZshList → ZshSublist → ZshPipe → ZshCommand</code>) is kept as-is. The bytecode compiler, <code>ZshCompiler</code>, is the original Rust part.</p>
+<p>Things that live in <code>src/extensions/</code> include AOT, plugin/script/autoload caches, the worker pool, ZWC helpers, and native line-editor engines ported from fish (syntax highlighting, autosuggestions, history search, autopair).</p>
+<h2 id="no-tree-walker">No tree walker</h2>
+<p>The tree-walking interpreter has been removed, and tests keep it removed. <code>tests/tree_walker_absent.rs</code> asserts that the old recursive dispatch functions (<code>execute_simple</code>, <code>execute_pipeline</code>, <code>execute_list</code>, <code>execute_compound</code>, <code>execute_command_bg</code>) do not exist in the source, and that <code>execute_command</code> goes through the parser and <code>ZshCompiler</code>. <code>tests/no_tree_walker_dispatch.rs</code> pins the behavior of every construct the deleted walker used to handle.</p>
+<h2 id="in-process-execution">In-process execution</h2>
+<p>zshrs replaces many <code>fork + exec</code> paths with in-process work. From the README&#x27;s comparison table:</p>
+<table>
+<thead><tr><th>Operation</th><th>zsh</th><th>zshrs</th></tr></thead>
+<tbody>
+<tr><td><code>$(cmd)</code></td><td>fork + pipe</td><td>In-process stdout capture via <code>dup2</code></td></tr>
+<tr><td><code>cat</code>, <code>head</code>, <code>sort</code>, <code>wc</code>, …</td><td>fork + exec</td><td>Builtin</td></tr>
+<tr><td><code>**/*.rs</code></td><td>Single-threaded <code>opendir</code></td><td>Parallel per-subdir descent on a rayon pool</td></tr>
+<tr><td><code>compinit</code></td><td>Synchronous fpath scan</td><td>Background scan on the worker pool</td></tr>
+<tr><td>Autoload</td><td>Read + parse every time</td><td>Bytecode loaded from rkyv</td></tr>
+</tbody>
+</table>
+<p>48 coreutils commands are builtins — the entries of <code>EXT_BUILTIN_NAMES</code> in <code>src/extensions/ext_builtins.rs</code> that GNU coreutils also installs.</p>
+<p>The worker pool is configured in <code>~/.zshrs/zshrs.toml</code>:</p>
+<pre class="language-toml" data-lang="toml"><code>[worker_pool]
+size = 8
+
+[glob]
+parallel_threshold = 32
+recursive_parallel = true</code></pre>
+<p>Extensions built on the pool include <code>async</code>/<code>await</code>, <code>pmap</code>, <code>pgrep</code>, <code>peach</code> and <code>barrier</code>, plus an <code>intercept</code> builtin for before/after/around advice on any command word:</p>
+<pre class="language-zsh" data-lang="zsh"><code>intercept after <span class="hl-string">&#x27;_*&#x27;</span> { echo <span class="hl-string">&quot;$INTERCEPT_NAME took ${INTERCEPT_MS}ms&quot;</span> }</code></pre>
+<p>The <code>{ … }</code> body form is a zshrs syntax extension; <code>zshrs --zsh</code> turns it off and rejects it the way <code>/bin/zsh</code> does.</p>
+<h2 id="compatibility-checks">Compatibility checks</h2>
+<p>The project measures compatibility against reference shells rather than manuals:</p>
+<ul>
+<li><code>tests/emulation_parity.rs</code> compares stdout and exit status of <code>zshrs --X</code> against the real shell X for the Bourne-family drop-ins (<code>--zsh</code>, <code>--bash</code>, <code>--ksh</code>, <code>--mksh</code>, <code>--pdksh</code>, <code>--sh</code>/<code>--posix</code>, <code>--dash</code>, <code>--ash</code>).</li>
+<li><code>bins/parity-fuzz.rs</code> runs grammar-driven, seed-replayable snippets through both zshrs and zsh and flags divergences.</li>
+<li><code>tests/ztst_runner.rs</code> runs upstream zsh&#x27;s own <code>.ztst</code> files.</li>
+</ul>
+<p>The README reports test counts measured on 2026-10-27:</p>
+<table>
+<thead><tr><th>Suite</th><th>Tests</th></tr></thead>
+<tbody>
+<tr><td><code>parity</code></td><td>49,500</td></tr>
+<tr><td><code>zsh_construct_corpus</code></td><td>396</td></tr>
+<tr><td><code>no_tree_walker_dispatch</code></td><td>174</td></tr>
+<tr><td><code>zsh_corpus_via_new_pipeline</code></td><td>123</td></tr>
+<tr><td><code>zsh_parser_probe</code></td><td>87</td></tr>
+<tr><td><code>compile_zsh_smoke</code></td><td>29</td></tr>
+<tr><td><code>tree_walker_absent</code></td><td>8</td></tr>
+</tbody>
+</table>
+<h2 id="performance-as-reported">Performance as reported</h2>
+<p>The README publishes hyperfine results (release build 0.13.27, Darwin arm64) and they are mixed. A few rows, mean milliseconds:</p>
+<table>
+<thead><tr><th>Workload</th><th style="text-align:right">zshrs</th><th style="text-align:right">zsh</th></tr></thead>
+<tbody>
+<tr><td>Startup (no-op)</td><td style="text-align:right">7.4</td><td style="text-align:right">4.6</td></tr>
+<tr><td>Arithmetic loop (100000)</td><td style="text-align:right">178.4</td><td style="text-align:right">122.3</td></tr>
+<tr><td>String append (5000)</td><td style="text-align:right">23.8</td><td style="text-align:right">52.4</td></tr>
+<tr><td>Command substitution (500)</td><td style="text-align:right">90.3</td><td style="text-align:right">268.9</td></tr>
+<tr><td>External spawn (200)</td><td style="text-align:right">226.1</td><td style="text-align:right">315.4</td></tr>
+</tbody>
+</table>
+<p>zshrs is ahead on command substitution, string append and external spawn, and behind on no-op startup, arithmetic loops and function calls in this run. The full table and the harness are in <code>bench/</code>.</p>
+<h2 id="install">Install</h2>
+<pre class="language-sh" data-lang="sh"><code>stall zshrs</code></pre>
+<p>Source and docs: <a href="https://github.com/MenkeTechnologies/zshrs" target="_blank" rel="noopener noreferrer">github.com/MenkeTechnologies/zshrs</a>.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="zshrs-bytecode-and-rkyv-cache.html"><span class="nav-label">Older</span><span class="nav-title">How zshrs Compiles Shell Code and Caches It in rkyv</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="zsh-more-completions-layout-install-harvest.html"><span class="nav-label">Newer</span><span class="nav-title">zsh-more-completions, Layout, Install and How Completions Get In</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

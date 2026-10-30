@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="The zshrs pipeline from zsh source to fusevm bytecode, its tiered JIT, and the rkyv cache that lets later processes skip lexing, parsing and compiling.">
+  <title>How zshrs Compiles Shell Code and Caches It in rkyv — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/zshrs-bytecode-and-rkyv-cache.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>How zshrs Compiles Shell Code and Caches It in rkyv</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 3 min read <span class="sep">·</span> <a class="post-tag" href="../tags/zshrs.html">#zshrs</a> <a class="post-tag" href="../tags/rust.html">#rust</a> <a class="post-tag" href="../tags/bytecode.html">#bytecode</a> <a class="post-tag" href="../tags/caching.html">#caching</a></span></p>
+      <article class="tutorial-section post-body">
+<p><a href="https://github.com/MenkeTechnologies/zshrs" target="_blank" rel="noopener noreferrer">zshrs</a> does not interpret an AST. Every command is lexed and parsed by ports of zsh&#x27;s C front end, compiled to <a href="https://github.com/MenkeTechnologies/fusevm" target="_blank" rel="noopener noreferrer">fusevm</a> bytecode, and run on a VM. Compiled chunks are persisted in rkyv files, so a script or autoload function compiled by one process can be loaded by the next without going through the front end again.</p>
+<h2 id="the-pipeline">The pipeline</h2>
+<p>From the README:</p>
+<pre><code>Interactive command  ──► lex::zshlex ──► parse::parse ──► ZshCompiler ──► fusevm::Op ──► VM::run()
+Script file (first)  ──► lex::zshlex ──► parse::parse ──► ZshCompiler ──► VM::run() ──► persist rkyv shard
+Script file (cached) ──► index.rkyv + mmap shard ──► deserialize Chunk ──► VM::run()
+Autoload function    ──► autoloads.rkyv ──► deserialize Chunk ──► VM::run()</code></pre>
+<p><code>lex::zshlex</code> and <code>parse::parse</code> are ports of <code>Src/lex.c</code> and <code>Src/parse.c</code>. <code>ZshCompiler</code> is the only original piece of the front end. It targets the same <code>Op</code> enum that <a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">strykelang</a> uses, so both languages share fused superinstructions, extension dispatch and the Cranelift JIT path.</p>
+<h2 id="execution-tiers">Execution tiers</h2>
+<p>Inside <code>fusevm::VM::run()</code> a chunk lands on one of several tiers:</p>
+<table>
+<thead><tr><th>Tier</th><th>What</th><th>When</th></tr></thead>
+<tbody>
+<tr><td>rkyv image hit</td><td>Skip lex/parse/compile</td><td>Warm script runs</td></tr>
+<tr><td>Block JIT</td><td>Native code via Cranelift</td><td>Loops, conditionals</td></tr>
+<tr><td>Linear JIT</td><td>Native code via Cranelift</td><td>Straight-line arithmetic</td></tr>
+<tr><td>Interpreter</td><td>Jump table + superinstructions</td><td>Builtins, I/O, strings</td></tr>
+</tbody>
+</table>
+<p>Enabling the JIT does not mean a given chunk is JIT-compiled. <code>zshrs --tiers</code> runs a script and then asks fusevm which tier took each chunk, using fusevm&#x27;s own predicates (<code>is_block_eligible</code>, <code>block_jit_is_compiled</code>, <code>trace_is_compiled</code>, <code>find_jit_region</code>). For chunks that reached neither JIT tier it lists the op kinds responsible:</p>
+<pre class="language-sh" data-lang="sh"><code>zshrs --tiers script.zsh</code></pre>
+<h2 id="cache-layout">Cache layout</h2>
+<p>Everything lives under <code>$ZSHRS_HOME</code> (default <code>~/.zshrs/</code>):</p>
+<table>
+<thead><tr><th>Path</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td><code>index.rkyv</code></td><td>Index: fq_name → shard id, generation, byte offset</td></tr>
+<tr><td><code>images/{hash8}-*.rkyv</code></td><td>Mmap-ready shards (system, completions, plugins, scripts, <code>.zshrc</code>, …)</td></tr>
+<tr><td><code>autoloads.rkyv</code></td><td>One compiled program per autoloaded function</td></tr>
+<tr><td><code>scripts.rkyv</code></td><td>One chunk per script run; per-event chunks for sourced files</td></tr>
+<tr><td><code>deparse.rkyv</code></td><td>Deparsed function bodies (what <code>$functions</code> prints)</td></tr>
+</tbody>
+</table>
+<p>The SQLite files in the same directory — <code>catalog.db</code> and the views used by <code>dbview</code> — are read-only mirrors for inspection. The README states they are never consulted for cache hit/miss or execution. <code>history.db</code> and <code>zshrs_history.db</code> hold history and are unrelated to bytecode caching.</p>
+<h2 id="invalidation-keys">Invalidation keys</h2>
+<p>Each store keys its entries on what determines the compiled output:</p>
+<ul>
+<li><strong>Autoloads</strong>: function name, the resolved fpath directory, a SHA-256 of the exact definition text, and the identity of the <code>zshrs</code> binary that compiled it. An edited function recompiles. Each entry also records what the <code>$fpath</code> search found, so a later load can skip the search while the directory is still on <code>fpath</code> and those files are unchanged.</li>
+<li><strong>Scripts</strong>: path, mtime, build, and the alias/option state the first run started from. A file that changes aliases or options itself is not stored.</li>
+<li><strong>Deparse</strong>: SHA-256 of the name, body text and the option state the body is re-lexed under, plus the binary identity.</li>
+</ul>
+<p>The autoload cache is bypassed for <code>ksh_autoload</code>-style bodies and for <code>autoload</code> without <code>-U</code>, because there the compiled program is not a function of the file&#x27;s bytes alone.</p>
+<h2 id="measured-effect">Measured effect</h2>
+<p>The README reports two sets of numbers.</p>
+<p>For <code>_git</code> (424 KB of shell): the first <code>git &lt;tab&gt;</code> in a process goes from <strong>1.06 s to 0.56 s</strong> once the chunk is cached; decoding the cached 4.6 MB chunk costs <strong>229 µs</strong> versus <strong>318 ms</strong> to parse and compile the file.</p>
+<p>The README&#x27;s cold vs warm comparison (it does not name the workload):</p>
+<pre><code>Cold (cache miss):  717ms  — lex + parse + compile + cache write + execute
+Warm (cache hit):     7ms  — deserialize + execute</code></pre>
+<h2 id="prewarming">Prewarming</h2>
+<p>Autoload entries are written through on first call, one per function actually used. To compile a whole directory up front:</p>
+<pre class="language-zsh" data-lang="zsh"><code>s            <span class="hl-comment"># every dir on $fpath</span>
+zshrs --prewarm-autoloads DIR ...    <span class="hl-comment"># just these</span>
+zd prewarm [DIR ...]                 <span class="hl-comment"># via the daemon</span>
+prewarm-autoloads [DIR ...]          <span class="hl-comment"># as a builtin inside a shell</span></code></pre>
+<p>Entries already current are skipped by SHA-256, so a re-run after adding one plugin compiles only the new completers. The README gives a sizing budget of roughly 6x the source size: a 13k-completer directory compiles to 165 MB in 35 s on a debug build. <code>zshrs-recorder</code> runs this pass at the end of every recording (<code>--no-prewarm</code> skips it); it must not run beside a live ZLE because the parser uses process-global lexer state.</p>
+<h2 id="inspecting-the-cache">Inspecting the cache</h2>
+<p><code>dbview</code> reads the mirrors without SQL:</p>
+<pre class="language-zsh" data-lang="zsh"><code></code></pre>
+<p>Source: <a href="https://github.com/MenkeTechnologies/zshrs" target="_blank" rel="noopener noreferrer">github.com/MenkeTechnologies/zshrs</a>.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <span class="nav-stub nav-prev"><span class="nav-label">Older</span><span class="nav-title">—</span></span>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="zshrs-architecture-overview.html"><span class="nav-label">Newer</span><span class="nav-title">Inside zshrs - A zsh Port in Rust Split Into Ported Code and Extensions</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

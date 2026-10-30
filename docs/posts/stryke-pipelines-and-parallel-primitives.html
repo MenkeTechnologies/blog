@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="How stryke combines Perl 5 syntax with pipe-forward, a threading macro, and rayon-backed parallel builtins.">
+  <title>Pipelines, Threading, and Parallel Primitives in stryke — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/stryke-pipelines-and-parallel-primitives.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>Pipelines, Threading, and Parallel Primitives in stryke</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 3 min read <span class="sep">·</span> <a class="post-tag" href="../tags/stryke.html">#stryke</a> <a class="post-tag" href="../tags/parallelism.html">#parallelism</a> <a class="post-tag" href="../tags/pipelines.html">#pipelines</a> <a class="post-tag" href="../tags/rust.html">#rust</a></span></p>
+      <article class="tutorial-section post-body">
+<p><a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">stryke</a> is a dynamic language implemented in Rust. The README describes it as an interpreter that &quot;parses and executes Perl 5 scripts with rayon-powered work-stealing primitives across every CPU core.&quot; On top of the Perl 5 base it adds pipe-forward, a threading macro, implicit block parameters, and a family of parallel builtins. A <code>--compat</code> flag turns all of those extensions off for running unmodified Perl.</p>
+<p>This post covers the pipeline syntax and the parallel primitives. Every example below was run against stryke v0.17.60 with <code>stryke -e</code>.</p>
+<h2 id="execution-model">Execution model</h2>
+<p>The README&#x27;s architecture section lays out the pipeline: lexer, recursive-descent and Pratt parser, compiler to bytecode, then a match-dispatch VM with a Cranelift block JIT. Hot subs are handed to the JIT after a configurable number of VM invocations (<code>STRYKE_JIT_SUB_INVOKES</code>, default 50), and <code>--no-jit</code> disables it. Values are a NaN-boxed <code>u64</code> (<code>StrykeValue</code>) that holds immediates inline and points at <code>Arc&lt;HeapObject&gt;</code> for strings, arrays, hashes, and the rest.</p>
+<p>Warm starts skip lex, parse, and compile by reading from an rkyv shard at <code>~/.stryke/scripts.rkyv</code>, which is mmapped for zero-copy lookup.</p>
+<p>String-bearing code segments are lowered to <a href="https://github.com/MenkeTechnologies/fusevm" target="_blank" rel="noopener noreferrer">fusevm</a>, the bytecode VM stryke shares with zshrs. Moving all execution onto fusevm is in progress; the migration checklist in the repo reports 126 of 362 stryke <code>Op</code> variants lowered.</p>
+<h2 id="pipe-forward">Pipe-forward: <code>|&gt;</code></h2>
+<p><code>|&gt;</code> is desugared at parse time. It passes the left side as the <strong>first</strong> argument of the call on the right, and associates left. <code>map</code>, <code>grep</code>/<code>filter</code>, <code>sort</code>, and <code>e</code> accept a blockless expression on the right-hand side:</p>
+<pre class="language-stryke" data-lang="stryke"><code><span class="hl-num">1</span>..<span class="hl-num">5</span> <span class="hl-op">|&gt;</span> map <span class="hl-var">$_</span> * <span class="hl-var">$_</span> <span class="hl-op">|&gt;</span> join <span class="hl-string">&quot;,&quot;</span> <span class="hl-op">|&gt;</span> p
+<span class="hl-comment"># 1,4,9,16,25</span></code></pre>
+<p>Per the README, <code>|&gt;</code> binds looser than <code>||</code> and tighter than <code>?:</code> and <code>and</code>/<code>or</code>/<code>not</code>, so <code>$x + 1 |&gt; f</code> parses as <code>f($x + 1)</code>.</p>
+<h2 id="the-threading-macro">The threading macro: <code>~&gt;</code></h2>
+<p><code>~&gt;</code> (aliases <code>thread</code>, <code>t</code>, <code>-&gt;&gt;</code>) chains stages without repeating <code>|&gt;</code>. Stages can be bare function names, functions that take a block, parenthesized calls with <code>_</code> as the placeholder, or anonymous blocks written <code>&gt;{ }</code>. Inside blocks, bare <code>_</code> is the topic (<code>$_</code>), and <code>_1</code> is the second positional.</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p>Block-taking stages chain directly, and <code>|&gt;</code> ends the macro:</p>
+<pre class="language-stryke" data-lang="stryke"><code>} sort{<span class="hl-var">$_1</span> <span class="hl-op">&lt;=&gt;</span> <span class="hl-var">$_0}</span> <span class="hl-op">|&gt;</span> join <span class="hl-string">&quot;,&quot;</span> <span class="hl-op">|&gt;</span> p
+<span class="hl-comment"># 400,324,256,196,144,100,64,36,16,4</span></code></pre>
+<p>Anonymous blocks and placeholder calls:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p>The README&#x27;s guidance: use <code>~&gt;</code> when most stages take blocks, and <code>|&gt;</code> for blockless expressions and unary functions.</p>
+<h2 id="parallel-primitives">Parallel primitives</h2>
+<p>Every parallel builtin runs on rayon&#x27;s work-stealing pool. The README states that each parallel block runs in its own interpreter context with captured lexical scope, and <code>-j N</code> sets the thread count. The parallel forms slot into pipelines like the sequential ones:</p>
+<pre class="language-stryke" data-lang="stryke"><code> = <span class="hl-var">@data</span> <span class="hl-op">|&gt;</span> psort { _ <span class="hl-op">&lt;=&gt;</span> _1 }; p join <span class="hl-string">&quot;,&quot;</span>, <span class="hl-var">@s</span>
+<span class="hl-comment"># 1,3,5,9</span>
+
+<span class="hl-kw">val</span> <span class="hl-var">@n</span> = <span class="hl-num">1</span>..<span class="hl-num">100</span>; <span class="hl-kw">val</span> <span class="hl-var">$s</span> = <span class="hl-var">@n</span> <span class="hl-op">|&gt;</span> preduce { _ + _1 }; p <span class="hl-var">$s</span>
+<span class="hl-comment"># 5050</span></code></pre>
+<p><code>pmap_reduce</code> fuses the map and the reduction:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p><code>fan_cap N { ... }</code> runs a block N times in parallel with the index as the topic and returns results in index order:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<h3 id="streaming">Streaming</h3>
+<p><code>pmaps</code>, <code>pgreps</code>, and <code>pflat_maps</code> are lazy. The README describes them as bounded-memory iterators that emit output as it completes, so an unbounded source can be cut off with <code>take</code>:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<h3 id="pipeline-objects">Pipeline objects</h3>
+<p><code>par_pipeline</code> builds a rayon-backed chain; <code>par_pipeline_stream</code> runs stages concurrently over bounded crossbeam channels and, per the README, does not preserve order. In v0.17.60 the method-call form works for both:</p>
+<pre class="language-stryke" data-lang="stryke"><code> <span class="hl-op">&lt;=&gt;</span> <span class="hl-var">$b</span> } <span class="hl-var">@r</span>
+<span class="hl-comment"># 1992,1994,1996,1998,2000</span></code></pre>
+<h2 id="shared-state-varsync">Shared state: <code>varsync</code></h2>
+<p>Workers get a copy of captured lexicals by default. A plain <code>my</code> counter incremented inside <code>pfor</code> is unchanged when the loop finishes:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p>To share state you opt in with <code>varsync</code>, which wraps the variable in <code>Arc&lt;Mutex&gt;</code>. Compound operators (<code>++</code>, <code>+=</code>, <code>.=</code>, <code>|=</code>, <code>&amp;=</code>) hold the lock for the whole read-modify-write:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<h2 id="further-reading">Further reading</h2>
+<p>The <a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">strykelang README</a> also covers channels (<code>pchannel</code>, <code>pselect</code>), <code>barrier</code>, <code>ploop</code>/<code>pwhile</code>, <code>ppool</code>, the parallel file-IO builtins (<code>par_lines</code>, <code>par_walk</code>, <code>glob_par</code>), and <code>pmap_on</code> for spreading a map across an SSH worker pool. <code>stryke docs pmap</code> opens the built-in reference at that topic.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="stryke-web-rails-style-framework.html"><span class="nav-label">Older</span><span class="nav-title">stryke web — A Rails-Shaped Framework for stryke</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="stryke-mcpd-mcp-servers-as-native-binaries.html"><span class="nav-label">Newer</span><span class="nav-title">MCP Servers as Single Native Binaries with stryke-mcpd</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

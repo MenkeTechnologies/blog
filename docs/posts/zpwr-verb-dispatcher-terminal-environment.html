@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="How zpwr installs, where its files live, and how its single dispatcher command exposes diagnostics, profiling, and snapshot tooling.">
+  <title>zpwr, a Terminal Environment Behind One Verb Dispatcher — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/zpwr-verb-dispatcher-terminal-environment.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>zpwr, a Terminal Environment Behind One Verb Dispatcher</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 4 min read <span class="sep">·</span> <a class="post-tag" href="../tags/zpwr.html">#zpwr</a> <a class="post-tag" href="../tags/zsh.html">#zsh</a> <a class="post-tag" href="../tags/tmux.html">#tmux</a> <a class="post-tag" href="../tags/dotfiles.html">#dotfiles</a></span></p>
+      <article class="tutorial-section post-body">
+<p><a href="https://github.com/MenkeTechnologies/zpwr" target="_blank" rel="noopener noreferrer">zpwr</a> is a terminal environment built on zinit. It configures the shell, tmux (ztmux), vim, completion and keybindings from a single repository. The README credits Hashrocket&#x27;s Dotmatrix as the original fork point. The installer sets <a href="https://github.com/MenkeTechnologies/zshrs" target="_blank" rel="noopener noreferrer">zshrs</a> as the login shell; stock zsh remains supported.</p>
+<p>Most of the environment is reached through one command: <code>zpwr &lt;verb&gt;</code>.</p>
+<h2 id="installing">Installing</h2>
+<p>One line:</p>
+<pre class="language-sh" data-lang="sh"><code>sh -c <span class="hl-string">&quot;$(curl -fsSL raw.githubusercontent.com/MenkeTechnologies/zpwr/main/install/s)&quot;</span></code></pre>
+<p><code>install/s</code> is a wrapper around the manual path:</p>
+<pre class="language-sh" data-lang="sh"><code>.zpwr/install &amp;&amp; ./zpwrInstall.sh</code></pre>
+<p>The installer confirms what it will install and overwrite before it runs. It builds the Rust toolchain components with cargo in the background, adds zshrs to <code>/etc/shells</code> and runs <code>chsh</code>. If zshrs is not on <code>PATH</code> when cargo finishes, it falls back to stock zsh. Zinit installs plugins on the first shell after install.</p>
+<p><code>zpwrInstall.sh</code> takes these flags:</p>
+<table>
+<thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>-a</code></td><td>Install all dependencies</td></tr>
+<tr><td><code>-c</code></td><td>Copy just configs</td></tr>
+<tr><td><code>-n</code></td><td>Do not start ztmux at end of installer</td></tr>
+<tr><td><code>-s</code></td><td>Skip main section</td></tr>
+<tr><td><code>-h</code></td><td>Display help</td></tr>
+<tr><td><code>-V</code></td><td>Display script version</td></tr>
+</tbody>
+</table>
+<p><code>-c</code> is the minimal install: configs only, no dependencies. The scripts in <code>~/.zpwr/install</code> can then be run one at a time.</p>
+<h2 id="layout">Layout</h2>
+<p>Everything lives under <code>~/.zpwr</code> (the <code>ZPWR</code> variable). <code>~/.zshrc</code>, <code>~/.vimrc</code>, <code>~/.tmux.conf</code> and the other configs are symlinked into <code>$HOME</code>. Previous configs are archived under <code>~/.zpwr/local</code>.</p>
+<p>Top-level directories at <code>origin/main</code>:</p>
+<table>
+<thead><tr><th>Path</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td><code>autoload/</code></td><td>autoloaded functions, split by <code>common</code>, <code>darwin</code>, <code>linux</code>, <code>fzf</code>, <code>comps</code>, <code>comp_utils</code>, <code>systemctl</code></td></tr>
+<tr><td><code>env/</code></td><td>environment and the verb table (<code>env/zpwr.zsh</code>)</td></tr>
+<tr><td><code>install/</code></td><td>installer scripts</td></tr>
+<tr><td><code>scripts/</code></td><td>standalone scripts</td></tr>
+<tr><td><code>tests/</code></td><td>zunit test files</td></tr>
+<tr><td><code>man/man1/</code></td><td><code>zpwr.1</code>, <code>zpwrall.1</code></td></tr>
+<tr><td><code>tmux/</code></td><td>tmux configuration</td></tr>
+<tr><td><code>local/</code></td><td>per-user state, git ignored</td></tr>
+</tbody>
+</table>
+<p>Two files carry user customization and survive <code>zpwr update</code>:</p>
+<ul>
+<li><code>~/.zpwr/local/.tokens.sh</code>, sourced before zsh config and zinit startup</li>
+<li><code>~/.zpwr/local/.tokens-post.sh</code>, sourced after all of it</li>
+</ul>
+<p>Extra zinit plugins go in the post file:</p>
+<pre class="language-zsh" data-lang="zsh"><code></code></pre>
+<h2 id="the-dispatcher">The dispatcher</h2>
+<p><code>env/zpwr.zsh</code> builds a global associative array, <code>ZPWR_VERBS</code>. Each key is a verb; each value is <code>function=description</code>:</p>
+<pre class="language-zsh" data-lang="zsh"><code> time with percentiles <span class="hl-kw">and</span> baseline diff&#x27;</code></pre>
+<p><code>zpwr</code> sources that file with the caller&#x27;s arguments on every call. <code>zpwr &lt;tab&gt;</code> gives grouped menu completion over the same table. <code>zpwr verbs</code> lists verbs in arb and runs the ones you pick, and <code>zpwr verbsedit</code> puts them on the command line.</p>
+<p>Counts from the table at <code>origin/main</code>:</p>
+<pre class="language-sh" data-lang="sh"><code>^]]+)\]=/<span class="hl-string">&#x27; | sort -u | wc -l
+# 460
+git show origin/main:env/zpwr.zsh | perl -ne &quot;print \&quot;\$1\n\&quot; if /^\s*ZPWR_VERBS\[[^]]+\]=&#x27;</span>([^=]+)=/&quot; | sort -u | wc -l
+<span class="hl-comment"># 373</span></code></pre>
+<p>That is 460 distinct verb names mapped onto 373 backing functions. Several verbs are aliases of each other; <code>wizard</code> and <code>docs</code> both run <code>zpwrWizard</code>. The README also lists 2000+ aliases and 360+ git aliases.</p>
+<h2 id="selected-verbs">Selected verbs</h2>
+<h3 id="zpwr-doctor">zpwr doctor</h3>
+<p>Scans for stale <code>.zwc</code> files, zcompdump freshness, duplicate and missing <code>PATH</code>/<code>FPATH</code> entries, broken symlinks, invalid named directories, missing dependencies, zinit installation, history files and config symlinks. Output is pass/warn/fail per check, then a summary.</p>
+<h3 id="zpwr-bench-zpwr-startup-zpwr-flame">zpwr bench / zpwr startup / zpwr flame</h3>
+<p>Three views of startup cost:</p>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<p><code>bench</code> stores its baseline and history in <code>$ZPWR_LOCAL/zpwr-bench-baseline.txt</code> and <code>$ZPWR_LOCAL/zpwr-bench-history.txt</code>.</p>
+<h3 id="zpwr-snapshot-zpwr-restore">zpwr snapshot / zpwr restore</h3>
+<p><code>zpwr snapshot [name]</code> writes named directories, aliases, environment variables, history, the directory stack, git repo status, tmux layout and vim sessions to <code>$ZPWR_LOCAL/snapshots/</code>. Restore can be partial:</p>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<p>Components are <code>hash</code>, <code>aliases</code>, <code>env</code>, <code>tmux</code>, <code>vim</code>, <code>history</code>, <code>dirs</code>. History is merged, not overwritten.</p>
+<h3 id="zpwr-pathaudit-zpwr-lint-zpwr-ports">zpwr pathaudit / zpwr lint / zpwr ports</h3>
+<ul>
+<li><code>pathaudit</code> checks <code>PATH</code>, <code>FPATH</code> and <code>MANPATH</code> for duplicates, missing directories and world-writable directories.</li>
+<li><code>lint</code> runs <code>zsh -n</code> on autoloads and env files and <code>shellcheck</code> on <code>scripts/</code> and <code>install/</code>.</li>
+<li><code>ports</code> lists listening TCP ports with process, PID, user and bind address; <code>-k PORT</code> kills the owner.</li>
+</ul>
+<h2 id="under-zshrs">Under zshrs</h2>
+<p>zshrs implements syntax highlighting, autosuggestions, autopair and history substring search in the shell itself, and ships a native powerlevel10k prompt engine. When <code>$ZSHRS_VERSION</code> is set, zpwr sets <code>ZPWR_NATIVE_ZLE=true</code> and skips the four equivalent zsh plugins so widgets are not wrapped twice. zshrs also adds an <code>async_precmd</code> hook that runs after the prompt is drawn. zpwr moves only the hooks named in <code>ZPWR_PRECMD_ASYNC_HOOKS</code> there, and the default list is <code>zpwrPrecmd</code>.</p>
+<h2 id="tests-docs-removal">Tests, docs, removal</h2>
+<ul>
+<li><code>zpwr test</code> runs the zunit suite; <code>zpwr testall</code> includes plugin tests. <code>origin/main</code> has 149 <code>tests/*.zsh</code> files.</li>
+<li><code>man zpwr</code> is the quick reference and <code>man zpwrall</code> is the full verb and variable catalog. Add <code>$ZPWR/man</code> to <code>MANPATH</code> first.</li>
+<li><code>zpwr updateall</code> relinks configs, pulls, updates plugins, regenerates caches and updates dependencies.</li>
+<li><code>zpwr uninstall</code> asks for confirmation, restores backups, unlinks configs and deletes the config directories.</li>
+</ul>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="zsh-more-completions-layout-install-harvest.html"><span class="nav-label">Older</span><span class="nav-title">zsh-more-completions, Layout, Install and How Completions Get In</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="welcome.html"><span class="nav-label">Newer</span><span class="nav-title">Welcome</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

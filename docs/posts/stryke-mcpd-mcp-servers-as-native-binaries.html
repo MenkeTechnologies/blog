@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="stryke-mcpd is a pure-stryke package that adds validated tool specs, crash-isolated serving, a root-jailed stock tool pack, and client helpers on top of stryke&#x27;s built-in MCP support.">
+  <title>MCP Servers as Single Native Binaries with stryke-mcpd — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/stryke-mcpd-mcp-servers-as-native-binaries.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>MCP Servers as Single Native Binaries with stryke-mcpd</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 3 min read <span class="sep">·</span> <a class="post-tag" href="../tags/stryke.html">#stryke</a> <a class="post-tag" href="../tags/mcp.html">#mcp</a> <a class="post-tag" href="../tags/packages.html">#packages</a></span></p>
+      <article class="tutorial-section post-body">
+<h2 id="what-it-is">What it is</h2>
+<p><a href="https://github.com/MenkeTechnologies/stryke-mcpd" target="_blank" rel="noopener noreferrer">stryke-mcpd</a> is a package for writing MCP (Model Context Protocol) servers in <a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">stryke</a>. The README states the target: write the server in a few lines, <code>s build --release</code> it, ship one binary, with no Node runtime or Python venv on the target machine.</p>
+<p>The protocol itself is not in this package. <code>mcp_server_start</code>, <code>mcp_connect</code>, <code>mcp_tools</code>, <code>mcp_call</code>, <code>mcp_close</code>, and the <code>tool fn</code> / <code>mcp_server &quot;name&quot; { ... }</code> desugar are strykelang core builtins. stryke-mcpd is the policy layer on top. It has no <code>[ffi]</code> table and no cdylib; the installed package is <code>stryke.toml</code> plus <code>lib/*.stk</code>.</p>
+<p>The README states the rule for what belongs in the package:</p>
+<blockquote>
+<p>If a function in this library can be replaced with one builtin call, it&#x27;s a bug.</p>
+</blockquote>
+<h2 id="the-two-rules-it-enforces">The two rules it enforces</h2>
+<p>The package exists to enforce two rules that stdio MCP servers depend on:</p>
+<ol>
+<li><strong>stdout belongs to the protocol.</strong> A stray <code>print</code> corrupts the JSON-RPC stream. <code>Mcpd::Server::log_to</code> sends diagnostics to a file, and <code>tests/repo-contract.sh</code> greps <code>lib/</code> and fails CI if any line writes to stdout.</li>
+<li><strong>A dying tool must not kill the server.</strong> Every <code>run</code> coderef is wrapped. A <code>die</code> inside a tool comes back to the client as an <code>ERROR: ...</code> text result, the failure is logged, and the server keeps serving.</li>
+</ol>
+<p>The wrapper strips the <code> at FILE line N.</code> suffix so the client sees only the message.</p>
+<h2 id="a-minimal-server">A minimal server</h2>
+<p>From <code>examples/calc_server.stk</code>:</p>
+<pre class="language-stryke" data-lang="stryke"><code><span class="hl-kw">use</span> Mcpd
+
+Mcpd::Server::serve(<span class="hl-string">&quot;calc&quot;</span>, [
+    Mcpd::Schema::tool(<span class="hl-string">&quot;add&quot;</span>, <span class="hl-string">&quot;Add two numbers&quot;</span>,
+        +{ a <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;number&quot;</span>, b <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;number&quot;</span> },
+        <span class="hl-kw">fn</span> { <span class="hl-kw">val</span> <span class="hl-var">$args</span> = shift; <span class="hl-var">$args</span><span class="hl-op">-&gt;</span>{a} + <span class="hl-var">$args</span><span class="hl-op">-&gt;</span>{b} }),
+
+    Mcpd::Schema::tool(<span class="hl-string">&quot;reverse_text&quot;</span>, <span class="hl-string">&quot;Reverse a string&quot;</span>,
+        +{ text <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;string&quot;</span> },
+        <span class="hl-kw">fn</span> { <span class="hl-kw">val</span> <span class="hl-var">$args</span> = shift; join(<span class="hl-string">&quot;&quot;</span>, reverse split <span class="hl-string">&quot;&quot;</span>, <span class="hl-var">$args</span><span class="hl-op">-&gt;</span>{text}) }),
+
+    Mcpd::Schema::tool(<span class="hl-string">&quot;always_fails&quot;</span>, <span class="hl-string">&quot;Demonstrates the error envelope&quot;</span>,
+        +{},
+        <span class="hl-kw">fn</span> { <span class="hl-kw">die</span> <span class="hl-string">&quot;intentional failure&quot;</span> }),
+])</code></pre>
+<p><code>serve</code> validates and wraps every spec, then hands the set to <code>mcp_server_start</code>. It blocks for the life of the server.</p>
+<h2 id="round-trip-from-the-client-side">Round trip from the client side</h2>
+<p>From <code>examples/round_trip.stk</code>, which connects to the server above over stdio:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p>Wiring into an MCP client config is <code>{ &quot;command&quot;: &quot;stryke&quot;, &quot;args&quot;: [&quot;server.stk&quot;] }</code>, or a built binary with no args.</p>
+<h2 id="the-four-modules">The four modules</h2>
+<table>
+<thead><tr><th>Module</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>Mcpd::Schema</code></td><td>Construction-time spec validation, arg checking, JSON Schema conversion</td></tr>
+<tr><td><code>Mcpd::Server</code></td><td><code>serve</code>, error wrapping, arg-checked serving, file-only logging</td></tr>
+<tr><td><code>Mcpd::Tools</code></td><td>Stock tool pack, root-jailed</td></tr>
+<tr><td><code>Mcpd::Client</code></td><td>Result-envelope extraction and call-then-extract helpers</td></tr>
+</tbody>
+</table>
+<p><strong>Schema.</strong> <code>mcp_server_start</code> accepts any <code>{name, description, parameters, run}</code> hashref and reports errors one tool at a time when the server starts. <code>Mcpd::Schema::tool</code> does the checks at construction time instead: the name must be an identifier, the description must be non-empty, each parameter type must be one of <code>string number boolean array object</code>, and <code>run</code> must be a coderef. <code>check_args</code> rejects missing params, undeclared extras, and mistyped numbers, arrays, and objects. <code>to_json_schema</code> and <code>to_tool_list</code> render the MCP <code>inputSchema</code> and <code>tools/list</code> payloads. <code>from_json_schema</code> and <code>from_tool_list</code> convert them back.</p>
+<p><strong>Server.</strong> Besides <code>serve</code> and <code>wrap</code>, <code>checked</code> and <code>wrap_all_checked</code> run <code>check_args</code> before the body, so a malformed call becomes an <code>ERROR:</code> envelope before the tool body runs.</p>
+<p><strong>Tools.</strong> <code>Mcpd::Tools::all</code> returns the stock pack: filesystem read, list, glob, grep, find, stat, du, head, tail, slice, hash, write, append, replace, chmod, mkdir, touch, rmdir, delete, copy, and move, plus <code>sh_exec</code>, <code>env_get</code>, <code>time_now</code>, and <code>sys_info</code>. Every filesystem path goes through <code>Mcpd::Tools::jail</code>, which normalizes <code>.</code>, <code>..</code>, and <code>//</code> lexically. A path that resolves outside the root dies, and the server wrapper turns that into an error result. <code>all(+{ readonly =&gt; 1 })</code> leaves out the mutating tools (<code>fs_write</code> through <code>fs_move</code>, and <code>sh_exec</code>). <code>sh_exec</code> takes an <code>allow</code> arrayref of permitted command words. Without <code>allow</code>, it runs any command.</p>
+<p>From <code>examples/jailed_fs.stk</code>, an escape attempt over a live connection:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<p><strong>Client.</strong> <code>text</code>, <code>texts</code>, <code>text_lines</code>, <code>content_of_type</code>, <code>is_error</code>, <code>error_message</code>, <code>tool_names</code>, <code>tool_schema</code>, and the <code>call_text</code> / <code>call_lines</code> / <code>call_texts</code> composites unpack the <code>+{content =&gt; [+{type =&gt; &quot;text&quot;, text =&gt; ...}]}</code> envelope.</p>
+<h2 id="cli">CLI</h2>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<h2 id="how-it-s-built-and-tested">How it&#x27;s built and tested</h2>
+<p>Install with <code>s pkg install -g github.com/MenkeTechnologies/stryke-mcpd</code>, or <code>s pkg install -g .</code> from a checkout. No cargo step is involved.</p>
+<p><code>t/test_mcpd.stk</code> tests Schema, Tools, and Client as pure functions, then runs a live round trip. It generates a server script, connects over stdio, lists and calls tools, calls one that dies, and confirms the next call on the same connection still succeeds. The CI job installs a prebuilt stryke release tarball, runs <code>stryke -c</code> on every <code>.stk</code> file in <code>lib/</code>, <code>bin/</code>, <code>t/</code>, and <code>examples/</code>, installs the package, and runs <code>s test t/</code>. Separate jobs run the shell gates under <code>tests/</code>, including the stdout check.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="stryke-pipelines-and-parallel-primitives.html"><span class="nav-label">Older</span><span class="nav-title">Pipelines, Threading, and Parallel Primitives in stryke</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="stryke-fleet-parallel-expect-playbooks.html"><span class="nav-label">Newer</span><span class="nav-title">Parallel Expect Playbooks with stryke-fleet</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

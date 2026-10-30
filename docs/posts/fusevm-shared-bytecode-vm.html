@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="How fusevm structures its opcode set, routes every execution tier through one op-semantics function, and lets stryke and zshrs share one runtime.">
+  <title>fusevm, the Bytecode VM Under stryke and zshrs — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/fusevm-shared-bytecode-vm.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>fusevm, the Bytecode VM Under stryke and zshrs</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 4 min read <span class="sep">·</span> <a class="post-tag" href="../tags/fusevm.html">#fusevm</a> <a class="post-tag" href="../tags/vm.html">#vm</a> <a class="post-tag" href="../tags/jit.html">#jit</a> <a class="post-tag" href="../tags/cranelift.html">#cranelift</a></span></p>
+      <article class="tutorial-section post-body">
+<p><a href="https://github.com/MenkeTechnologies/fusevm" target="_blank" rel="noopener noreferrer">fusevm</a> is a language-agnostic bytecode VM written in Rust. Frontends compile their source to a single <code>Op</code> enum, build a <code>Chunk</code>, and hand it to <code>VM::run()</code>. The VM does not know which language produced the bytecode. The fusevm README lists zshrs and stryke first among the frontends that target it.</p>
+<p>This post covers the op set, the execution tiers, and how the two frontends divide the shared machinery.</p>
+<h2 id="building-and-running-a-chunk">Building and running a chunk</h2>
+<p>The core API is three types: <code>ChunkBuilder</code>, <code>VM</code>, and <code>Value</code>. From the README:</p>
+<pre class="language-rust" data-lang="rust"><code>use fusevm::{Op, ChunkBuilder, VM, VMResult, Value};
+
+let mut b = ChunkBuilder::new();
+b.emit(Op::LoadInt(40), 1);
+b.emit(Op::LoadInt(2), 1);
+b.emit(Op::Add, 1);
+
+let mut vm = VM::new(b.build());
+match vm.run() {
+    VMResult::Ok(val) =&gt; println!(&quot;result: {}&quot;, val.to_str()),  // &quot;42&quot;
+    VMResult::Error(e) =&gt; eprintln!(&quot;error: {}&quot;, e),
+    VMResult::Halted =&gt; {}
+}</code></pre>
+<p>Execution is stack-based, with slot-indexed fast paths for locals.</p>
+<h2 id="the-op-set">The op set</h2>
+<p>The README counts 237 opcodes across 22 sections in <code>src/op.rs</code>. Besides the usual stack, variable, arithmetic, comparison, and control-flow ops, the set has dedicated sections for shell, AWK, higher-order, and concurrency semantics:</p>
+<table>
+<thead><tr><th>Section</th><th>Count</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td>Shell ops</td><td>29</td><td><code>Exec</code>, <code>PipelineBegin</code>, <code>Redirect</code>, <code>Glob</code></td></tr>
+<tr><td>AWK ops</td><td>61</td><td><code>AwkFieldGet</code>, <code>AwkPrint</code>, <code>AwkGensub</code></td></tr>
+<tr><td>Higher-order</td><td>5</td><td><code>MapBlock</code>, <code>GrepBlock</code>, <code>SortBlock</code></td></tr>
+<tr><td>Cooperative concurrency</td><td>12</td><td><code>Go</code>, <code>ChanMake</code>, <code>ChanSend</code>, <code>Select</code></td></tr>
+<tr><td>Fused</td><td>11</td><td><code>AccumSumLoop</code>, <code>SlotIncLtIntJumpBack</code></td></tr>
+<tr><td>Extension</td><td>2</td><td><code>Extended(u16, u8)</code>, <code>ExtendedWide(u16, usize)</code></td></tr>
+</tbody>
+</table>
+<h3 id="fused-superinstructions">Fused superinstructions</h3>
+<p>A frontend compiler that recognizes a common sequence can emit one fused op in its place. <code>AccumSumLoop(sum, i, limit)</code> replaces the seven-op sequence <code>GetSlot + GetSlot + Add + SetSlot + PreInc + NumLt + JumpIfFalse</code> for a counted sum loop. <code>SlotIncLtIntJumpBack</code> collapses a loop backedge into one dispatch. Each fused op removes the dispatch cycles and stack traffic of the ops it replaces.</p>
+<h2 id="one-function-defines-op-semantics">One function defines op semantics</h2>
+<p>fusevm has four ways to run a chunk: the interpreter, three JIT tiers, and an ahead-of-time compiler. All of them route through, or fall back to, <code>VM::exec_op</code> in <code>src/vm.rs</code>, which the source documents as &quot;the single source of truth for op semantics.&quot;</p>
+<table>
+<thead><tr><th>Tier</th><th>Entry</th><th>How it runs an op</th></tr></thead>
+<tbody>
+<tr><td>Interpreter</td><td><code>VM::run</code></td><td>Calls <code>exec_op</code> per op in a dispatch loop</td></tr>
+<tr><td>Linear / Block / Tracing JIT</td><td><code>JitCompiler</code></td><td>Emits Cranelift IR for the eligible int/float/slot subset; anything else bails or deopts to the interpreter</td></tr>
+<tr><td>AOT</td><td><code>aot::compile_object</code></td><td>One Cranelift block per op; unspecialized ops call <code>exec_op</code> through an <code>extern &quot;C&quot;</code> shim</td></tr>
+</tbody>
+</table>
+<p>A new op is implemented once, in <code>exec_op</code>, and every tier inherits it. The JIT and AOT paths only specialize the scalar ops; string, array, hash, and host ops stay in the interpreter.</p>
+<h2 id="the-jit-tiers">The JIT tiers</h2>
+<p>The JIT uses Cranelift 0.130 behind the <code>jit</code> feature flag and emits native x86-64 or aarch64. A chunk is served by one of three tiers:</p>
+<table>
+<thead><tr><th>Tier</th><th>Trigger</th><th>Coverage</th></tr></thead>
+<tbody>
+<tr><td>Linear</td><td>First call, if eligible</td><td>Straight-line expression chunks</td></tr>
+<tr><td>Block</td><td>1 invocation (default)</td><td>Whole-chunk CFG: loops, branches, fused backedges, globals</td></tr>
+<tr><td>Tracing</td><td>50 backedges through a loop header</td><td>Recorded hot path, type-specialized, deopts on guard miss</td></tr>
+</tbody>
+</table>
+<p>Both thresholds can be set per process with <code>FUSEVM_JIT_BLOCK_THRESHOLD</code> and <code>FUSEVM_JIT_TRACE_THRESHOLD</code>, or per thread through <code>TraceJitConfig</code>.</p>
+<p>On a tracing guard miss, the VM rebuilds the value stack and any inlined call frames, then resumes <code>exec_op</code> at the deopt IP.</p>
+<p>The <code>jit-disk-cache</code> feature persists compiled code to <code>~/.cache/fusevm-jit</code>, so codegen is skipped across process restarts. The <code>aot</code> feature lowers a whole chunk to a relocatable object through <code>cranelift-object</code> and links it against the runtime into a standalone executable; each frontend&#x27;s <code>--build</code> calls into it.</p>
+<h2 id="how-stryke-and-zshrs-share-it">How stryke and zshrs share it</h2>
+<p>Both frontends emit the same <code>Op</code> enum, and each reaches language-specific behavior through a different extension path.</p>
+<p><strong>zshrs</strong> emits no extended ops. Shell semantics go through the <code>ShellHost</code> trait, which handles <code>Glob</code>, <code>TildeExpand</code>, <code>CmdSubst</code>, <code>Redirect</code>, pipelines, traps, and the other shell ops. zshrs supplies the real implementation; without one the VM uses stubs that keep the stack balanced. Builtins lower to <code>CallBuiltin(id, argc)</code> with IDs from <code>shell_builtins.rs</code> plus zshrs&#x27;s own.</p>
+<p><strong>stryke</strong> reserves two disjoint blocks of <code>Extended</code> op IDs: one at <code>0x0000</code> (<code>ext_ops</code> in <code>fusevm_bridge.rs</code>) and one at <code>0x1000</code> (<code>nops</code> in <code>fusevm_native.rs</code>). The VM dispatches them through a handler the frontend registers with <code>VM::set_extension_handler</code>. Because each frontend owns its own ID space, the tables do not conflict.</p>
+<p>stryke&#x27;s adoption is partial. Its README describes <code>fusevm_bridge.rs</code> as a tier-0 JIT that sends string-bearing segments to fusevm&#x27;s block JIT, while stryke&#x27;s own block JIT handles pure-integer segments. The repo&#x27;s migration checklist sets the goal of retiring stryke&#x27;s own <code>vm.rs</code> and <code>jit.rs</code>, and reports 126 of 362 stryke <code>Op</code> variants with native fusevm lowering.</p>
+<p>The two also share a process. stryke depends on zshrs as a library, so both must resolve to one fusevm version. stryke&#x27;s <code>Cargo.toml</code> requires <code>fusevm = &quot;0.26.7&quot;</code>, the same minor zshrs uses, and explains why: fusevm defines about 54 <code>#[no_mangle]</code> symbols, and two semver-incompatible copies in one dependency graph fail to link on duplicate symbols.</p>
+<h2 id="install">Install</h2>
+<pre class="language-sh" data-lang="sh"><code>cargo add fusevm --features jit   <span class="hl-comment"># with Cranelift JIT</span>
+cargo add fusevm                  <span class="hl-comment"># interpreter only</span></code></pre>
+<p>Source and benchmarks are in the <a href="https://github.com/MenkeTechnologies/fusevm" target="_blank" rel="noopener noreferrer">fusevm repository</a>.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="stryke-fleet-parallel-expect-playbooks.html"><span class="nav-label">Older</span><span class="nav-title">Parallel Expect Playbooks with stryke-fleet</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <span class="nav-stub nav-next"><span class="nav-label">Newer</span><span class="nav-title">—</span></span>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>

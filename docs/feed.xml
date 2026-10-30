@@ -9,6 +9,382 @@
   <author><name>MenkeTechnologies</name></author>
   <generator>stryke</generator>
   <entry>
+    <title>fusevm, the Bytecode VM Under stryke and zshrs</title>
+    <link href="https://menketechnologies.github.io/blog/posts/fusevm-shared-bytecode-vm.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/fusevm-shared-bytecode-vm.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>How fusevm structures its opcode set, routes every execution tier through one op-semantics function, and lets stryke and zshrs share one runtime.</summary>
+    <category term="fusevm"/>
+    <category term="vm"/>
+    <category term="jit"/>
+    <category term="cranelift"/>
+    <content type="html">&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/fusevm&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;fusevm&lt;/a&gt; is a language-agnostic bytecode VM written in Rust. Frontends compile their source to a single &lt;code&gt;Op&lt;/code&gt; enum, build a &lt;code&gt;Chunk&lt;/code&gt;, and hand it to &lt;code&gt;VM::run()&lt;/code&gt;. The VM does not know which language produced the bytecode. The fusevm README lists zshrs and stryke first among the frontends that target it.&lt;/p&gt;
+&lt;p&gt;This post covers the op set, the execution tiers, and how the two frontends divide the shared machinery.&lt;/p&gt;
+&lt;h2 id=&quot;building-and-running-a-chunk&quot;&gt;Building and running a chunk&lt;/h2&gt;
+&lt;p&gt;The core API is three types: &lt;code&gt;ChunkBuilder&lt;/code&gt;, &lt;code&gt;VM&lt;/code&gt;, and &lt;code&gt;Value&lt;/code&gt;. From the README:&lt;/p&gt;
+&lt;pre class=&quot;language-rust&quot; data-lang=&quot;rust&quot;&gt;&lt;code&gt;use fusevm::{Op, ChunkBuilder, VM, VMResult, Value};
+
+let mut b = ChunkBuilder::new();
+b.emit(Op::LoadInt(40), 1);
+b.emit(Op::LoadInt(2), 1);
+b.emit(Op::Add, 1);
+
+let mut vm = VM::new(b.build());
+match vm.run() {
+    VMResult::Ok(val) =&amp;gt; println!(&amp;quot;result: {}&amp;quot;, val.to_str()),  // &amp;quot;42&amp;quot;
+    VMResult::Error(e) =&amp;gt; eprintln!(&amp;quot;error: {}&amp;quot;, e),
+    VMResult::Halted =&amp;gt; {}
+}&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Execution is stack-based, with slot-indexed fast paths for locals.&lt;/p&gt;
+&lt;h2 id=&quot;the-op-set&quot;&gt;The op set&lt;/h2&gt;
+&lt;p&gt;The README counts 237 opcodes across 22 sections in &lt;code&gt;src/op.rs&lt;/code&gt;. Besides the usual stack, variable, arithmetic, comparison, and control-flow ops, the set has dedicated sections for shell, AWK, higher-order, and concurrency semantics:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Section&lt;/th&gt;&lt;th&gt;Count&lt;/th&gt;&lt;th&gt;Examples&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;Shell ops&lt;/td&gt;&lt;td&gt;29&lt;/td&gt;&lt;td&gt;&lt;code&gt;Exec&lt;/code&gt;, &lt;code&gt;PipelineBegin&lt;/code&gt;, &lt;code&gt;Redirect&lt;/code&gt;, &lt;code&gt;Glob&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;AWK ops&lt;/td&gt;&lt;td&gt;61&lt;/td&gt;&lt;td&gt;&lt;code&gt;AwkFieldGet&lt;/code&gt;, &lt;code&gt;AwkPrint&lt;/code&gt;, &lt;code&gt;AwkGensub&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Higher-order&lt;/td&gt;&lt;td&gt;5&lt;/td&gt;&lt;td&gt;&lt;code&gt;MapBlock&lt;/code&gt;, &lt;code&gt;GrepBlock&lt;/code&gt;, &lt;code&gt;SortBlock&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Cooperative concurrency&lt;/td&gt;&lt;td&gt;12&lt;/td&gt;&lt;td&gt;&lt;code&gt;Go&lt;/code&gt;, &lt;code&gt;ChanMake&lt;/code&gt;, &lt;code&gt;ChanSend&lt;/code&gt;, &lt;code&gt;Select&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Fused&lt;/td&gt;&lt;td&gt;11&lt;/td&gt;&lt;td&gt;&lt;code&gt;AccumSumLoop&lt;/code&gt;, &lt;code&gt;SlotIncLtIntJumpBack&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Extension&lt;/td&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;&lt;code&gt;Extended(u16, u8)&lt;/code&gt;, &lt;code&gt;ExtendedWide(u16, usize)&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id=&quot;fused-superinstructions&quot;&gt;Fused superinstructions&lt;/h3&gt;
+&lt;p&gt;A frontend compiler that recognizes a common sequence can emit one fused op in its place. &lt;code&gt;AccumSumLoop(sum, i, limit)&lt;/code&gt; replaces the seven-op sequence &lt;code&gt;GetSlot + GetSlot + Add + SetSlot + PreInc + NumLt + JumpIfFalse&lt;/code&gt; for a counted sum loop. &lt;code&gt;SlotIncLtIntJumpBack&lt;/code&gt; collapses a loop backedge into one dispatch. Each fused op removes the dispatch cycles and stack traffic of the ops it replaces.&lt;/p&gt;
+&lt;h2 id=&quot;one-function-defines-op-semantics&quot;&gt;One function defines op semantics&lt;/h2&gt;
+&lt;p&gt;fusevm has four ways to run a chunk: the interpreter, three JIT tiers, and an ahead-of-time compiler. All of them route through, or fall back to, &lt;code&gt;VM::exec_op&lt;/code&gt; in &lt;code&gt;src/vm.rs&lt;/code&gt;, which the source documents as &amp;quot;the single source of truth for op semantics.&amp;quot;&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Tier&lt;/th&gt;&lt;th&gt;Entry&lt;/th&gt;&lt;th&gt;How it runs an op&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;Interpreter&lt;/td&gt;&lt;td&gt;&lt;code&gt;VM::run&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Calls &lt;code&gt;exec_op&lt;/code&gt; per op in a dispatch loop&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Linear / Block / Tracing JIT&lt;/td&gt;&lt;td&gt;&lt;code&gt;JitCompiler&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Emits Cranelift IR for the eligible int/float/slot subset; anything else bails or deopts to the interpreter&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;AOT&lt;/td&gt;&lt;td&gt;&lt;code&gt;aot::compile_object&lt;/code&gt;&lt;/td&gt;&lt;td&gt;One Cranelift block per op; unspecialized ops call &lt;code&gt;exec_op&lt;/code&gt; through an &lt;code&gt;extern &amp;quot;C&amp;quot;&lt;/code&gt; shim&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;A new op is implemented once, in &lt;code&gt;exec_op&lt;/code&gt;, and every tier inherits it. The JIT and AOT paths only specialize the scalar ops; string, array, hash, and host ops stay in the interpreter.&lt;/p&gt;
+&lt;h2 id=&quot;the-jit-tiers&quot;&gt;The JIT tiers&lt;/h2&gt;
+&lt;p&gt;The JIT uses Cranelift 0.130 behind the &lt;code&gt;jit&lt;/code&gt; feature flag and emits native x86-64 or aarch64. A chunk is served by one of three tiers:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Tier&lt;/th&gt;&lt;th&gt;Trigger&lt;/th&gt;&lt;th&gt;Coverage&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;Linear&lt;/td&gt;&lt;td&gt;First call, if eligible&lt;/td&gt;&lt;td&gt;Straight-line expression chunks&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Block&lt;/td&gt;&lt;td&gt;1 invocation (default)&lt;/td&gt;&lt;td&gt;Whole-chunk CFG: loops, branches, fused backedges, globals&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Tracing&lt;/td&gt;&lt;td&gt;50 backedges through a loop header&lt;/td&gt;&lt;td&gt;Recorded hot path, type-specialized, deopts on guard miss&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;Both thresholds can be set per process with &lt;code&gt;FUSEVM_JIT_BLOCK_THRESHOLD&lt;/code&gt; and &lt;code&gt;FUSEVM_JIT_TRACE_THRESHOLD&lt;/code&gt;, or per thread through &lt;code&gt;TraceJitConfig&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;On a tracing guard miss, the VM rebuilds the value stack and any inlined call frames, then resumes &lt;code&gt;exec_op&lt;/code&gt; at the deopt IP.&lt;/p&gt;
+&lt;p&gt;The &lt;code&gt;jit-disk-cache&lt;/code&gt; feature persists compiled code to &lt;code&gt;~/.cache/fusevm-jit&lt;/code&gt;, so codegen is skipped across process restarts. The &lt;code&gt;aot&lt;/code&gt; feature lowers a whole chunk to a relocatable object through &lt;code&gt;cranelift-object&lt;/code&gt; and links it against the runtime into a standalone executable; each frontend&amp;#x27;s &lt;code&gt;--build&lt;/code&gt; calls into it.&lt;/p&gt;
+&lt;h2 id=&quot;how-stryke-and-zshrs-share-it&quot;&gt;How stryke and zshrs share it&lt;/h2&gt;
+&lt;p&gt;Both frontends emit the same &lt;code&gt;Op&lt;/code&gt; enum, and each reaches language-specific behavior through a different extension path.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;zshrs&lt;/strong&gt; emits no extended ops. Shell semantics go through the &lt;code&gt;ShellHost&lt;/code&gt; trait, which handles &lt;code&gt;Glob&lt;/code&gt;, &lt;code&gt;TildeExpand&lt;/code&gt;, &lt;code&gt;CmdSubst&lt;/code&gt;, &lt;code&gt;Redirect&lt;/code&gt;, pipelines, traps, and the other shell ops. zshrs supplies the real implementation; without one the VM uses stubs that keep the stack balanced. Builtins lower to &lt;code&gt;CallBuiltin(id, argc)&lt;/code&gt; with IDs from &lt;code&gt;shell_builtins.rs&lt;/code&gt; plus zshrs&amp;#x27;s own.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;stryke&lt;/strong&gt; reserves two disjoint blocks of &lt;code&gt;Extended&lt;/code&gt; op IDs: one at &lt;code&gt;0x0000&lt;/code&gt; (&lt;code&gt;ext_ops&lt;/code&gt; in &lt;code&gt;fusevm_bridge.rs&lt;/code&gt;) and one at &lt;code&gt;0x1000&lt;/code&gt; (&lt;code&gt;nops&lt;/code&gt; in &lt;code&gt;fusevm_native.rs&lt;/code&gt;). The VM dispatches them through a handler the frontend registers with &lt;code&gt;VM::set_extension_handler&lt;/code&gt;. Because each frontend owns its own ID space, the tables do not conflict.&lt;/p&gt;
+&lt;p&gt;stryke&amp;#x27;s adoption is partial. Its README describes &lt;code&gt;fusevm_bridge.rs&lt;/code&gt; as a tier-0 JIT that sends string-bearing segments to fusevm&amp;#x27;s block JIT, while stryke&amp;#x27;s own block JIT handles pure-integer segments. The repo&amp;#x27;s migration checklist sets the goal of retiring stryke&amp;#x27;s own &lt;code&gt;vm.rs&lt;/code&gt; and &lt;code&gt;jit.rs&lt;/code&gt;, and reports 126 of 362 stryke &lt;code&gt;Op&lt;/code&gt; variants with native fusevm lowering.&lt;/p&gt;
+&lt;p&gt;The two also share a process. stryke depends on zshrs as a library, so both must resolve to one fusevm version. stryke&amp;#x27;s &lt;code&gt;Cargo.toml&lt;/code&gt; requires &lt;code&gt;fusevm = &amp;quot;0.26.7&amp;quot;&lt;/code&gt;, the same minor zshrs uses, and explains why: fusevm defines about 54 &lt;code&gt;#[no_mangle]&lt;/code&gt; symbols, and two semver-incompatible copies in one dependency graph fail to link on duplicate symbols.&lt;/p&gt;
+&lt;h2 id=&quot;install&quot;&gt;Install&lt;/h2&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;cargo add fusevm --features jit   &lt;span class=&quot;hl-comment&quot;&gt;# with Cranelift JIT&lt;/span&gt;
+cargo add fusevm                  &lt;span class=&quot;hl-comment&quot;&gt;# interpreter only&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Source and benchmarks are in the &lt;a href=&quot;https://github.com/MenkeTechnologies/fusevm&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;fusevm repository&lt;/a&gt;.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
+    <title>Parallel Expect Playbooks with stryke-fleet</title>
+    <link href="https://menketechnologies.github.io/blog/posts/stryke-fleet-parallel-expect-playbooks.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/stryke-fleet-parallel-expect-playbooks.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>stryke-fleet is a pure-stryke package that adds transcripted PTY sessions, declarative playbooks, a recipe corpus for interactive CLIs, and parallel multi-target fan-out on top of stryke&#x27;s pty builtins and pmap.</summary>
+    <category term="stryke"/>
+    <category term="pty"/>
+    <category term="automation"/>
+    <content type="html">&lt;h2 id=&quot;what-it-is&quot;&gt;What it is&lt;/h2&gt;
+&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/stryke-fleet&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;stryke-fleet&lt;/a&gt; is parallel expect/PTY automation written as a pure-stryke package. It has no &lt;code&gt;[ffi]&lt;/code&gt; table and no cdylib; the installed package is &lt;code&gt;stryke.toml&lt;/code&gt; plus &lt;code&gt;lib/*.stk&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;The spawn/expect/send loop itself is in &lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;strykelang&lt;/a&gt; core: &lt;code&gt;pty_spawn&lt;/code&gt;, &lt;code&gt;pty_send&lt;/code&gt;, &lt;code&gt;pty_read&lt;/code&gt;, &lt;code&gt;pty_expect&lt;/code&gt;, &lt;code&gt;pty_expect_table&lt;/code&gt;, &lt;code&gt;pty_buffer&lt;/code&gt;, &lt;code&gt;pty_alive&lt;/code&gt;, &lt;code&gt;pty_eof&lt;/code&gt;, &lt;code&gt;pty_close&lt;/code&gt;, and &lt;code&gt;pty_interact&lt;/code&gt; are builtins, and &lt;code&gt;pmap&lt;/code&gt; provides the thread pool. The README describes what core does not provide as policy: what a step is, what a failed run returns, what an ssh login chain looks like, and what shape a transcript has. That policy lives in this package so it can be versioned independently of the language.&lt;/p&gt;
+&lt;h2 id=&quot;the-four-layers&quot;&gt;The four layers&lt;/h2&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Module&lt;/th&gt;&lt;th&gt;Role&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Fleet::Session&lt;/code&gt;&lt;/td&gt;&lt;td&gt;PTY session that records every send, match, timeout, and close&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Fleet::Playbook&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Declarative step lists run in order against one session&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Fleet::Recipes&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Step-list generators for common interactive CLIs&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Fleet::Fanout&lt;/code&gt;&lt;/td&gt;&lt;td&gt;One playbook, N targets, one PTY per target in parallel&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id=&quot;session&quot;&gt;Session&lt;/h3&gt;
+&lt;p&gt;&lt;code&gt;Fleet::Session::open&lt;/code&gt; wraps a &lt;code&gt;pty_spawn&lt;/code&gt; handle in a hashref with a log. &lt;code&gt;send&lt;/code&gt;, &lt;code&gt;expect&lt;/code&gt;, &lt;code&gt;branch&lt;/code&gt;, and &lt;code&gt;close&lt;/code&gt; append events, so a failed run returns the full interaction log rather than leaving a stuck process. Additions over the raw builtins include:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;send_secret&lt;/code&gt;, which transmits the text but logs &lt;code&gt;***&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;send_control&lt;/code&gt;, for Ctrl-C, Ctrl-D, and similar&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;expect_exact&lt;/code&gt;, which quotemetas its argument for a literal match&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;expect_any&lt;/code&gt;, which reports which of several prompts arrived&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;drain&lt;/code&gt;, which reads until the child goes idle&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;transcript_text&lt;/code&gt;, which dumps one &lt;code&gt;EVENT&amp;lt;TAB&amp;gt;DATA&lt;/code&gt; line per event&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id=&quot;playbook&quot;&gt;Playbook&lt;/h3&gt;
+&lt;p&gt;A playbook is an arrayref of step hashrefs. The step keys are:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;expect&lt;/code&gt;, &lt;code&gt;branches&lt;/code&gt;, and &lt;code&gt;send&lt;/code&gt; (each step needs at least one of these)&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;send_matched&lt;/code&gt;, which sends the result of the matching branch&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;timeout&lt;/code&gt;, in seconds (default 30)&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;name&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;optional&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;retries&lt;/code&gt; and &lt;code&gt;retry_send&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;delay&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;The first non-optional expect or branch that times out fails the run, and the error names the step. &lt;code&gt;run&lt;/code&gt; returns &lt;code&gt;+{ ok, cmd, steps_run, transcript }&lt;/code&gt;, plus &lt;code&gt;failed_step&lt;/code&gt; and &lt;code&gt;error&lt;/code&gt; on failure. &lt;code&gt;dry_run&lt;/code&gt; renders the steps without spawning anything.&lt;/p&gt;
+&lt;h3 id=&quot;recipes&quot;&gt;Recipes&lt;/h3&gt;
+&lt;p&gt;Recipes return playbook arrayrefs and never spawn anything themselves. That makes them composable with &lt;code&gt;@{...}&lt;/code&gt; splices and testable without a network. &lt;code&gt;Fleet::Recipes::names&lt;/code&gt; lists 48 generators. They include:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;ssh_login&lt;/code&gt;, &lt;code&gt;sudo&lt;/code&gt;, &lt;code&gt;su&lt;/code&gt;, &lt;code&gt;doas&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;psql&lt;/code&gt;, &lt;code&gt;mysql&lt;/code&gt;, &lt;code&gt;mariadb&lt;/code&gt;, &lt;code&gt;redis_cli&lt;/code&gt;, &lt;code&gt;mongo&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;telnet_login&lt;/code&gt;, &lt;code&gt;sftp&lt;/code&gt;, &lt;code&gt;scp&lt;/code&gt;, &lt;code&gt;rsync&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;passwd_change&lt;/code&gt;, &lt;code&gt;docker_login&lt;/code&gt;, &lt;code&gt;cisco_enable&lt;/code&gt;, &lt;code&gt;yes_to_all&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;restic&lt;/code&gt;, &lt;code&gt;borg&lt;/code&gt;, &lt;code&gt;age&lt;/code&gt;, &lt;code&gt;vault_login&lt;/code&gt;, &lt;code&gt;cryptsetup&lt;/code&gt;, &lt;code&gt;bw_unlock&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id=&quot;fanout&quot;&gt;Fanout&lt;/h3&gt;
+&lt;p&gt;&lt;code&gt;Fleet::Fanout::run&lt;/code&gt; validates the steps once, then calls &lt;code&gt;pmap { Fleet::Playbook::run($_, $steps, $opts) }&lt;/code&gt; over the command list. Each target gets its own PTY on its own thread, and results come back in target order. &lt;code&gt;batch&lt;/code&gt; caps concurrency at K targets at a time. &lt;code&gt;ssh&lt;/code&gt; builds &lt;code&gt;ssh [opts] [user@]HOST&lt;/code&gt; commands from a host list.&lt;/p&gt;
+&lt;p&gt;Post-processing functions:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;partition&lt;/code&gt;, &lt;code&gt;count&lt;/code&gt;, &lt;code&gt;summarize&lt;/code&gt;, and &lt;code&gt;all_ok&lt;/code&gt; for pass/fail totals&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;group_by_error&lt;/code&gt;, which buckets failures by error string&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;group_by_output&lt;/code&gt;, which buckets successes by output; its doc comment describes this as config-drift detection&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;grep_transcript&lt;/code&gt;, which answers &amp;quot;which hosts printed X&amp;quot;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;retry_failed&lt;/code&gt; and &lt;code&gt;retry_until&lt;/code&gt;, which re-run only the failures&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2 id=&quot;usage&quot;&gt;Usage&lt;/h2&gt;
+&lt;p&gt;A local playbook from &lt;code&gt;examples/local_demo.stk&lt;/code&gt;. It needs no network:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;span class=&quot;hl-kw&quot;&gt;use&lt;/span&gt; Fleet
+
+&lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$r&lt;/span&gt; = Fleet::Playbook::run(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;sh&amp;quot;&lt;/span&gt;, [
+    +{ send   &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;echo fleet-$$\n&amp;quot;&lt;/span&gt; },
+    +{ expect &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; qr/fleet-\d+/, timeout &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-num&quot;&gt;10&lt;/span&gt;, name &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;echo back&amp;quot;&lt;/span&gt; },
+    +{ send   &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;exit\n&amp;quot;&lt;/span&gt; },
+])
+
+p &lt;span class=&quot;hl-var&quot;&gt;$r&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{ok} ? &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;ok — &amp;quot;&lt;/span&gt; . &lt;span class=&quot;hl-var&quot;&gt;$r&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{steps_run} . &lt;span class=&quot;hl-string&quot;&gt;&amp;quot; steps&amp;quot;&lt;/span&gt; : &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;failed: &amp;quot;&lt;/span&gt; . &lt;span class=&quot;hl-var&quot;&gt;$r&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{error}&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The main use case is one login recipe run against many hosts. From &lt;code&gt;examples/parallel_ssh.stk&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;h([&lt;span class=&quot;hl-var&quot;&gt;@hosts&lt;/span&gt;], [&lt;span class=&quot;hl-var&quot;&gt;@steps&lt;/span&gt;], +{ ssh_opts &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;-o BatchMode=no&amp;quot;&lt;/span&gt; })
+&lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$part&lt;/span&gt;    = Fleet::Fanout::partition(&lt;span class=&quot;hl-var&quot;&gt;$results&lt;/span&gt;)&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;ssh_login&lt;/code&gt; opens with a branch table. It accepts a host-key &lt;code&gt;(yes/no)?&lt;/code&gt; prompt, a password prompt, or a shell prompt directly, and it is marked optional. It then optionally answers a password and expects the shell prompt.&lt;/p&gt;
+&lt;p&gt;An installer driven by &lt;code&gt;yes_to_all&lt;/code&gt;, from &lt;code&gt;examples/installer_autopilot.stk&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;cli&quot;&gt;CLI&lt;/h2&gt;
+&lt;p&gt;For one-shot expect/send from the shell:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The README directs anything with branches, retries, or more than two steps to a playbook script.&lt;/p&gt;
+&lt;h2 id=&quot;scope-boundary&quot;&gt;Scope boundary&lt;/h2&gt;
+&lt;p&gt;The README separates Fleet from stryke&amp;#x27;s &lt;code&gt;cluster([...])&lt;/code&gt; + &lt;code&gt;pmap_on&lt;/code&gt;, which are persistent SSH worker pools for non-interactive remote compute. Fleet is for sessions that prompt back.&lt;/p&gt;
+&lt;h2 id=&quot;how-it-s-built-and-tested&quot;&gt;How it&amp;#x27;s built and tested&lt;/h2&gt;
+&lt;p&gt;Install with &lt;code&gt;s pkg install -g github.com/MenkeTechnologies/stryke-fleet&lt;/code&gt;, or &lt;code&gt;s pkg install -g .&lt;/code&gt; from a checkout.&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;t/test_fleet.stk&lt;/code&gt; is headless-CI safe by contract. Every PTY assertion drives a local &lt;code&gt;cat&lt;/code&gt; or &lt;code&gt;sh&lt;/code&gt;, and recipes are tested as data. &lt;code&gt;tests/repo-contract.sh&lt;/code&gt; fails the build if any test in &lt;code&gt;t/&lt;/code&gt; spawns &lt;code&gt;ssh&lt;/code&gt; or calls &lt;code&gt;Fanout::ssh&lt;/code&gt;. CI installs a prebuilt stryke release, runs &lt;code&gt;stryke -c&lt;/code&gt; on every &lt;code&gt;.stk&lt;/code&gt; file in &lt;code&gt;lib/&lt;/code&gt;, &lt;code&gt;bin/&lt;/code&gt;, &lt;code&gt;t/&lt;/code&gt;, and &lt;code&gt;examples/&lt;/code&gt;, installs the package, and runs &lt;code&gt;s test t/&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;The package is MIT-licensed.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
+    <title>MCP Servers as Single Native Binaries with stryke-mcpd</title>
+    <link href="https://menketechnologies.github.io/blog/posts/stryke-mcpd-mcp-servers-as-native-binaries.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/stryke-mcpd-mcp-servers-as-native-binaries.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>stryke-mcpd is a pure-stryke package that adds validated tool specs, crash-isolated serving, a root-jailed stock tool pack, and client helpers on top of stryke&#x27;s built-in MCP support.</summary>
+    <category term="stryke"/>
+    <category term="mcp"/>
+    <category term="packages"/>
+    <content type="html">&lt;h2 id=&quot;what-it-is&quot;&gt;What it is&lt;/h2&gt;
+&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/stryke-mcpd&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;stryke-mcpd&lt;/a&gt; is a package for writing MCP (Model Context Protocol) servers in &lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;stryke&lt;/a&gt;. The README states the target: write the server in a few lines, &lt;code&gt;s build --release&lt;/code&gt; it, ship one binary, with no Node runtime or Python venv on the target machine.&lt;/p&gt;
+&lt;p&gt;The protocol itself is not in this package. &lt;code&gt;mcp_server_start&lt;/code&gt;, &lt;code&gt;mcp_connect&lt;/code&gt;, &lt;code&gt;mcp_tools&lt;/code&gt;, &lt;code&gt;mcp_call&lt;/code&gt;, &lt;code&gt;mcp_close&lt;/code&gt;, and the &lt;code&gt;tool fn&lt;/code&gt; / &lt;code&gt;mcp_server &amp;quot;name&amp;quot; { ... }&lt;/code&gt; desugar are strykelang core builtins. stryke-mcpd is the policy layer on top. It has no &lt;code&gt;[ffi]&lt;/code&gt; table and no cdylib; the installed package is &lt;code&gt;stryke.toml&lt;/code&gt; plus &lt;code&gt;lib/*.stk&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;The README states the rule for what belongs in the package:&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;If a function in this library can be replaced with one builtin call, it&amp;#x27;s a bug.&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;h2 id=&quot;the-two-rules-it-enforces&quot;&gt;The two rules it enforces&lt;/h2&gt;
+&lt;p&gt;The package exists to enforce two rules that stdio MCP servers depend on:&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;stdout belongs to the protocol.&lt;/strong&gt; A stray &lt;code&gt;print&lt;/code&gt; corrupts the JSON-RPC stream. &lt;code&gt;Mcpd::Server::log_to&lt;/code&gt; sends diagnostics to a file, and &lt;code&gt;tests/repo-contract.sh&lt;/code&gt; greps &lt;code&gt;lib/&lt;/code&gt; and fails CI if any line writes to stdout.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;A dying tool must not kill the server.&lt;/strong&gt; Every &lt;code&gt;run&lt;/code&gt; coderef is wrapped. A &lt;code&gt;die&lt;/code&gt; inside a tool comes back to the client as an &lt;code&gt;ERROR: ...&lt;/code&gt; text result, the failure is logged, and the server keeps serving.&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;The wrapper strips the &lt;code&gt; at FILE line N.&lt;/code&gt; suffix so the client sees only the message.&lt;/p&gt;
+&lt;h2 id=&quot;a-minimal-server&quot;&gt;A minimal server&lt;/h2&gt;
+&lt;p&gt;From &lt;code&gt;examples/calc_server.stk&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;span class=&quot;hl-kw&quot;&gt;use&lt;/span&gt; Mcpd
+
+Mcpd::Server::serve(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;calc&amp;quot;&lt;/span&gt;, [
+    Mcpd::Schema::tool(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;add&amp;quot;&lt;/span&gt;, &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;Add two numbers&amp;quot;&lt;/span&gt;,
+        +{ a &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;number&amp;quot;&lt;/span&gt;, b &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;number&amp;quot;&lt;/span&gt; },
+        &lt;span class=&quot;hl-kw&quot;&gt;fn&lt;/span&gt; { &lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$args&lt;/span&gt; = shift; &lt;span class=&quot;hl-var&quot;&gt;$args&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{a} + &lt;span class=&quot;hl-var&quot;&gt;$args&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{b} }),
+
+    Mcpd::Schema::tool(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;reverse_text&amp;quot;&lt;/span&gt;, &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;Reverse a string&amp;quot;&lt;/span&gt;,
+        +{ text &lt;span class=&quot;hl-op&quot;&gt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;string&amp;quot;&lt;/span&gt; },
+        &lt;span class=&quot;hl-kw&quot;&gt;fn&lt;/span&gt; { &lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$args&lt;/span&gt; = shift; join(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;&amp;quot;&lt;/span&gt;, reverse split &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;&amp;quot;&lt;/span&gt;, &lt;span class=&quot;hl-var&quot;&gt;$args&lt;/span&gt;&lt;span class=&quot;hl-op&quot;&gt;-&amp;gt;&lt;/span&gt;{text}) }),
+
+    Mcpd::Schema::tool(&lt;span class=&quot;hl-string&quot;&gt;&amp;quot;always_fails&amp;quot;&lt;/span&gt;, &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;Demonstrates the error envelope&amp;quot;&lt;/span&gt;,
+        +{},
+        &lt;span class=&quot;hl-kw&quot;&gt;fn&lt;/span&gt; { &lt;span class=&quot;hl-kw&quot;&gt;die&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;intentional failure&amp;quot;&lt;/span&gt; }),
+])&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;serve&lt;/code&gt; validates and wraps every spec, then hands the set to &lt;code&gt;mcp_server_start&lt;/code&gt;. It blocks for the life of the server.&lt;/p&gt;
+&lt;h2 id=&quot;round-trip-from-the-client-side&quot;&gt;Round trip from the client side&lt;/h2&gt;
+&lt;p&gt;From &lt;code&gt;examples/round_trip.stk&lt;/code&gt;, which connects to the server above over stdio:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Wiring into an MCP client config is &lt;code&gt;{ &amp;quot;command&amp;quot;: &amp;quot;stryke&amp;quot;, &amp;quot;args&amp;quot;: [&amp;quot;server.stk&amp;quot;] }&lt;/code&gt;, or a built binary with no args.&lt;/p&gt;
+&lt;h2 id=&quot;the-four-modules&quot;&gt;The four modules&lt;/h2&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Module&lt;/th&gt;&lt;th&gt;Role&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Mcpd::Schema&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Construction-time spec validation, arg checking, JSON Schema conversion&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Mcpd::Server&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&lt;code&gt;serve&lt;/code&gt;, error wrapping, arg-checked serving, file-only logging&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Mcpd::Tools&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Stock tool pack, root-jailed&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;Mcpd::Client&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Result-envelope extraction and call-then-extract helpers&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;Schema.&lt;/strong&gt; &lt;code&gt;mcp_server_start&lt;/code&gt; accepts any &lt;code&gt;{name, description, parameters, run}&lt;/code&gt; hashref and reports errors one tool at a time when the server starts. &lt;code&gt;Mcpd::Schema::tool&lt;/code&gt; does the checks at construction time instead: the name must be an identifier, the description must be non-empty, each parameter type must be one of &lt;code&gt;string number boolean array object&lt;/code&gt;, and &lt;code&gt;run&lt;/code&gt; must be a coderef. &lt;code&gt;check_args&lt;/code&gt; rejects missing params, undeclared extras, and mistyped numbers, arrays, and objects. &lt;code&gt;to_json_schema&lt;/code&gt; and &lt;code&gt;to_tool_list&lt;/code&gt; render the MCP &lt;code&gt;inputSchema&lt;/code&gt; and &lt;code&gt;tools/list&lt;/code&gt; payloads. &lt;code&gt;from_json_schema&lt;/code&gt; and &lt;code&gt;from_tool_list&lt;/code&gt; convert them back.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Server.&lt;/strong&gt; Besides &lt;code&gt;serve&lt;/code&gt; and &lt;code&gt;wrap&lt;/code&gt;, &lt;code&gt;checked&lt;/code&gt; and &lt;code&gt;wrap_all_checked&lt;/code&gt; run &lt;code&gt;check_args&lt;/code&gt; before the body, so a malformed call becomes an &lt;code&gt;ERROR:&lt;/code&gt; envelope before the tool body runs.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Tools.&lt;/strong&gt; &lt;code&gt;Mcpd::Tools::all&lt;/code&gt; returns the stock pack: filesystem read, list, glob, grep, find, stat, du, head, tail, slice, hash, write, append, replace, chmod, mkdir, touch, rmdir, delete, copy, and move, plus &lt;code&gt;sh_exec&lt;/code&gt;, &lt;code&gt;env_get&lt;/code&gt;, &lt;code&gt;time_now&lt;/code&gt;, and &lt;code&gt;sys_info&lt;/code&gt;. Every filesystem path goes through &lt;code&gt;Mcpd::Tools::jail&lt;/code&gt;, which normalizes &lt;code&gt;.&lt;/code&gt;, &lt;code&gt;..&lt;/code&gt;, and &lt;code&gt;//&lt;/code&gt; lexically. A path that resolves outside the root dies, and the server wrapper turns that into an error result. &lt;code&gt;all(+{ readonly =&amp;gt; 1 })&lt;/code&gt; leaves out the mutating tools (&lt;code&gt;fs_write&lt;/code&gt; through &lt;code&gt;fs_move&lt;/code&gt;, and &lt;code&gt;sh_exec&lt;/code&gt;). &lt;code&gt;sh_exec&lt;/code&gt; takes an &lt;code&gt;allow&lt;/code&gt; arrayref of permitted command words. Without &lt;code&gt;allow&lt;/code&gt;, it runs any command.&lt;/p&gt;
+&lt;p&gt;From &lt;code&gt;examples/jailed_fs.stk&lt;/code&gt;, an escape attempt over a live connection:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;Client.&lt;/strong&gt; &lt;code&gt;text&lt;/code&gt;, &lt;code&gt;texts&lt;/code&gt;, &lt;code&gt;text_lines&lt;/code&gt;, &lt;code&gt;content_of_type&lt;/code&gt;, &lt;code&gt;is_error&lt;/code&gt;, &lt;code&gt;error_message&lt;/code&gt;, &lt;code&gt;tool_names&lt;/code&gt;, &lt;code&gt;tool_schema&lt;/code&gt;, and the &lt;code&gt;call_text&lt;/code&gt; / &lt;code&gt;call_lines&lt;/code&gt; / &lt;code&gt;call_texts&lt;/code&gt; composites unpack the &lt;code&gt;+{content =&amp;gt; [+{type =&amp;gt; &amp;quot;text&amp;quot;, text =&amp;gt; ...}]}&lt;/code&gt; envelope.&lt;/p&gt;
+&lt;h2 id=&quot;cli&quot;&gt;CLI&lt;/h2&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;how-it-s-built-and-tested&quot;&gt;How it&amp;#x27;s built and tested&lt;/h2&gt;
+&lt;p&gt;Install with &lt;code&gt;s pkg install -g github.com/MenkeTechnologies/stryke-mcpd&lt;/code&gt;, or &lt;code&gt;s pkg install -g .&lt;/code&gt; from a checkout. No cargo step is involved.&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;t/test_mcpd.stk&lt;/code&gt; tests Schema, Tools, and Client as pure functions, then runs a live round trip. It generates a server script, connects over stdio, lists and calls tools, calls one that dies, and confirms the next call on the same connection still succeeds. The CI job installs a prebuilt stryke release tarball, runs &lt;code&gt;stryke -c&lt;/code&gt; on every &lt;code&gt;.stk&lt;/code&gt; file in &lt;code&gt;lib/&lt;/code&gt;, &lt;code&gt;bin/&lt;/code&gt;, &lt;code&gt;t/&lt;/code&gt;, and &lt;code&gt;examples/&lt;/code&gt;, installs the package, and runs &lt;code&gt;s test t/&lt;/code&gt;. Separate jobs run the shell gates under &lt;code&gt;tests/&lt;/code&gt;, including the stdout check.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
+    <title>Pipelines, Threading, and Parallel Primitives in stryke</title>
+    <link href="https://menketechnologies.github.io/blog/posts/stryke-pipelines-and-parallel-primitives.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/stryke-pipelines-and-parallel-primitives.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>How stryke combines Perl 5 syntax with pipe-forward, a threading macro, and rayon-backed parallel builtins.</summary>
+    <category term="stryke"/>
+    <category term="parallelism"/>
+    <category term="pipelines"/>
+    <category term="rust"/>
+    <content type="html">&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;stryke&lt;/a&gt; is a dynamic language implemented in Rust. The README describes it as an interpreter that &amp;quot;parses and executes Perl 5 scripts with rayon-powered work-stealing primitives across every CPU core.&amp;quot; On top of the Perl 5 base it adds pipe-forward, a threading macro, implicit block parameters, and a family of parallel builtins. A &lt;code&gt;--compat&lt;/code&gt; flag turns all of those extensions off for running unmodified Perl.&lt;/p&gt;
+&lt;p&gt;This post covers the pipeline syntax and the parallel primitives. Every example below was run against stryke v0.17.60 with &lt;code&gt;stryke -e&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;execution-model&quot;&gt;Execution model&lt;/h2&gt;
+&lt;p&gt;The README&amp;#x27;s architecture section lays out the pipeline: lexer, recursive-descent and Pratt parser, compiler to bytecode, then a match-dispatch VM with a Cranelift block JIT. Hot subs are handed to the JIT after a configurable number of VM invocations (&lt;code&gt;STRYKE_JIT_SUB_INVOKES&lt;/code&gt;, default 50), and &lt;code&gt;--no-jit&lt;/code&gt; disables it. Values are a NaN-boxed &lt;code&gt;u64&lt;/code&gt; (&lt;code&gt;StrykeValue&lt;/code&gt;) that holds immediates inline and points at &lt;code&gt;Arc&amp;lt;HeapObject&amp;gt;&lt;/code&gt; for strings, arrays, hashes, and the rest.&lt;/p&gt;
+&lt;p&gt;Warm starts skip lex, parse, and compile by reading from an rkyv shard at &lt;code&gt;~/.stryke/scripts.rkyv&lt;/code&gt;, which is mmapped for zero-copy lookup.&lt;/p&gt;
+&lt;p&gt;String-bearing code segments are lowered to &lt;a href=&quot;https://github.com/MenkeTechnologies/fusevm&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;fusevm&lt;/a&gt;, the bytecode VM stryke shares with zshrs. Moving all execution onto fusevm is in progress; the migration checklist in the repo reports 126 of 362 stryke &lt;code&gt;Op&lt;/code&gt; variants lowered.&lt;/p&gt;
+&lt;h2 id=&quot;pipe-forward&quot;&gt;Pipe-forward: &lt;code&gt;|&amp;gt;&lt;/code&gt;&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;|&amp;gt;&lt;/code&gt; is desugared at parse time. It passes the left side as the &lt;strong&gt;first&lt;/strong&gt; argument of the call on the right, and associates left. &lt;code&gt;map&lt;/code&gt;, &lt;code&gt;grep&lt;/code&gt;/&lt;code&gt;filter&lt;/code&gt;, &lt;code&gt;sort&lt;/code&gt;, and &lt;code&gt;e&lt;/code&gt; accept a blockless expression on the right-hand side:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;span class=&quot;hl-num&quot;&gt;1&lt;/span&gt;..&lt;span class=&quot;hl-num&quot;&gt;5&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; map &lt;span class=&quot;hl-var&quot;&gt;$_&lt;/span&gt; * &lt;span class=&quot;hl-var&quot;&gt;$_&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; join &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;,&amp;quot;&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; p
+&lt;span class=&quot;hl-comment&quot;&gt;# 1,4,9,16,25&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Per the README, &lt;code&gt;|&amp;gt;&lt;/code&gt; binds looser than &lt;code&gt;||&lt;/code&gt; and tighter than &lt;code&gt;?:&lt;/code&gt; and &lt;code&gt;and&lt;/code&gt;/&lt;code&gt;or&lt;/code&gt;/&lt;code&gt;not&lt;/code&gt;, so &lt;code&gt;$x + 1 |&amp;gt; f&lt;/code&gt; parses as &lt;code&gt;f($x + 1)&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;the-threading-macro&quot;&gt;The threading macro: &lt;code&gt;~&amp;gt;&lt;/code&gt;&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;~&amp;gt;&lt;/code&gt; (aliases &lt;code&gt;thread&lt;/code&gt;, &lt;code&gt;t&lt;/code&gt;, &lt;code&gt;-&amp;gt;&amp;gt;&lt;/code&gt;) chains stages without repeating &lt;code&gt;|&amp;gt;&lt;/code&gt;. Stages can be bare function names, functions that take a block, parenthesized calls with &lt;code&gt;_&lt;/code&gt; as the placeholder, or anonymous blocks written &lt;code&gt;&amp;gt;{ }&lt;/code&gt;. Inside blocks, bare &lt;code&gt;_&lt;/code&gt; is the topic (&lt;code&gt;$_&lt;/code&gt;), and &lt;code&gt;_1&lt;/code&gt; is the second positional.&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Block-taking stages chain directly, and &lt;code&gt;|&amp;gt;&lt;/code&gt; ends the macro:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;} sort{&lt;span class=&quot;hl-var&quot;&gt;$_1&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;&amp;lt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$_0}&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; join &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;,&amp;quot;&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; p
+&lt;span class=&quot;hl-comment&quot;&gt;# 400,324,256,196,144,100,64,36,16,4&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Anonymous blocks and placeholder calls:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The README&amp;#x27;s guidance: use &lt;code&gt;~&amp;gt;&lt;/code&gt; when most stages take blocks, and &lt;code&gt;|&amp;gt;&lt;/code&gt; for blockless expressions and unary functions.&lt;/p&gt;
+&lt;h2 id=&quot;parallel-primitives&quot;&gt;Parallel primitives&lt;/h2&gt;
+&lt;p&gt;Every parallel builtin runs on rayon&amp;#x27;s work-stealing pool. The README states that each parallel block runs in its own interpreter context with captured lexical scope, and &lt;code&gt;-j N&lt;/code&gt; sets the thread count. The parallel forms slot into pipelines like the sequential ones:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt; = &lt;span class=&quot;hl-var&quot;&gt;@data&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; psort { _ &lt;span class=&quot;hl-op&quot;&gt;&amp;lt;=&amp;gt;&lt;/span&gt; _1 }; p join &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;,&amp;quot;&lt;/span&gt;, &lt;span class=&quot;hl-var&quot;&gt;@s&lt;/span&gt;
+&lt;span class=&quot;hl-comment&quot;&gt;# 1,3,5,9&lt;/span&gt;
+
+&lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;@n&lt;/span&gt; = &lt;span class=&quot;hl-num&quot;&gt;1&lt;/span&gt;..&lt;span class=&quot;hl-num&quot;&gt;100&lt;/span&gt;; &lt;span class=&quot;hl-kw&quot;&gt;val&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$s&lt;/span&gt; = &lt;span class=&quot;hl-var&quot;&gt;@n&lt;/span&gt; &lt;span class=&quot;hl-op&quot;&gt;|&amp;gt;&lt;/span&gt; preduce { _ + _1 }; p &lt;span class=&quot;hl-var&quot;&gt;$s&lt;/span&gt;
+&lt;span class=&quot;hl-comment&quot;&gt;# 5050&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;pmap_reduce&lt;/code&gt; fuses the map and the reduction:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;fan_cap N { ... }&lt;/code&gt; runs a block N times in parallel with the index as the topic and returns results in index order:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h3 id=&quot;streaming&quot;&gt;Streaming&lt;/h3&gt;
+&lt;p&gt;&lt;code&gt;pmaps&lt;/code&gt;, &lt;code&gt;pgreps&lt;/code&gt;, and &lt;code&gt;pflat_maps&lt;/code&gt; are lazy. The README describes them as bounded-memory iterators that emit output as it completes, so an unbounded source can be cut off with &lt;code&gt;take&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h3 id=&quot;pipeline-objects&quot;&gt;Pipeline objects&lt;/h3&gt;
+&lt;p&gt;&lt;code&gt;par_pipeline&lt;/code&gt; builds a rayon-backed chain; &lt;code&gt;par_pipeline_stream&lt;/code&gt; runs stages concurrently over bounded crossbeam channels and, per the README, does not preserve order. In v0.17.60 the method-call form works for both:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt; &lt;span class=&quot;hl-op&quot;&gt;&amp;lt;=&amp;gt;&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$b&lt;/span&gt; } &lt;span class=&quot;hl-var&quot;&gt;@r&lt;/span&gt;
+&lt;span class=&quot;hl-comment&quot;&gt;# 1992,1994,1996,1998,2000&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;shared-state-varsync&quot;&gt;Shared state: &lt;code&gt;varsync&lt;/code&gt;&lt;/h2&gt;
+&lt;p&gt;Workers get a copy of captured lexicals by default. A plain &lt;code&gt;my&lt;/code&gt; counter incremented inside &lt;code&gt;pfor&lt;/code&gt; is unchanged when the loop finishes:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;To share state you opt in with &lt;code&gt;varsync&lt;/code&gt;, which wraps the variable in &lt;code&gt;Arc&amp;lt;Mutex&amp;gt;&lt;/code&gt;. Compound operators (&lt;code&gt;++&lt;/code&gt;, &lt;code&gt;+=&lt;/code&gt;, &lt;code&gt;.=&lt;/code&gt;, &lt;code&gt;|=&lt;/code&gt;, &lt;code&gt;&amp;amp;=&lt;/code&gt;) hold the lock for the whole read-modify-write:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;further-reading&quot;&gt;Further reading&lt;/h2&gt;
+&lt;p&gt;The &lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;strykelang README&lt;/a&gt; also covers channels (&lt;code&gt;pchannel&lt;/code&gt;, &lt;code&gt;pselect&lt;/code&gt;), &lt;code&gt;barrier&lt;/code&gt;, &lt;code&gt;ploop&lt;/code&gt;/&lt;code&gt;pwhile&lt;/code&gt;, &lt;code&gt;ppool&lt;/code&gt;, the parallel file-IO builtins (&lt;code&gt;par_lines&lt;/code&gt;, &lt;code&gt;par_walk&lt;/code&gt;, &lt;code&gt;glob_par&lt;/code&gt;), and &lt;code&gt;pmap_on&lt;/code&gt; for spreading a map across an SSH worker pool. &lt;code&gt;stryke docs pmap&lt;/code&gt; opens the built-in reference at that topic.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
+    <title>stryke web — A Rails-Shaped Framework for stryke</title>
+    <link href="https://menketechnologies.github.io/blog/posts/stryke-web-rails-style-framework.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/stryke-web-rails-style-framework.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>What the stryke web generator and runtime ship today, and which parts of the design doc are still targets.</summary>
+    <category term="stryke"/>
+    <category term="web"/>
+    <category term="framework"/>
+    <category term="rust"/>
+    <content type="html">&lt;p&gt;stryke web is the web framework for &lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;strykelang&lt;/a&gt;. It has two halves: a Rust CLI, &lt;code&gt;s_web&lt;/code&gt;, that generates &lt;code&gt;.stk&lt;/code&gt; source for a new app, and a set of &lt;code&gt;web_*&lt;/code&gt; runtime builtins inside the stryke interpreter that serve it. The design doc is &lt;code&gt;docs/WEB_FRAMEWORK.md&lt;/code&gt;; the generator reference is &lt;code&gt;stryke_web/README.md&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;The design doc marks its own status: Phase 0 shipped, most of Phase 1 shipped, Phase 2 mostly deferred, Phase 3 not started. This post follows that split.&lt;/p&gt;
+&lt;h2 id=&quot;architecture&quot;&gt;Architecture&lt;/h2&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Layer&lt;/th&gt;&lt;th&gt;Language&lt;/th&gt;&lt;th&gt;Location&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;Generator CLI (&lt;code&gt;s_web new&lt;/code&gt;, &lt;code&gt;g&lt;/code&gt;, &lt;code&gt;s&lt;/code&gt;, &lt;code&gt;db&lt;/code&gt;, &lt;code&gt;routes&lt;/code&gt;)&lt;/td&gt;&lt;td&gt;Rust&lt;/td&gt;&lt;td&gt;&lt;code&gt;stryke_web/&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Generated app code (&lt;code&gt;config/routes.stk&lt;/code&gt;, controllers, models)&lt;/td&gt;&lt;td&gt;stryke&lt;/td&gt;&lt;td&gt;the user&amp;#x27;s app directory&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Framework runtime (&lt;code&gt;web_route&lt;/code&gt;, &lt;code&gt;web_render&lt;/code&gt;, ORM, migrations)&lt;/td&gt;&lt;td&gt;Rust builtins&lt;/td&gt;&lt;td&gt;&lt;code&gt;strykelang/web.rs&lt;/code&gt;, &lt;code&gt;strykelang/web_orm.rs&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;The &lt;code&gt;stryke_web&lt;/code&gt; crate opts out of the parent workspace with its own &lt;code&gt;[workspace]&lt;/code&gt; table, so it builds independently of the interpreter. Its only runtime dependencies are &lt;code&gt;clap&lt;/code&gt; and &lt;code&gt;heck&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;shipped-the-generator&quot;&gt;Shipped: the generator&lt;/h2&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;s_web new myblog
+cd myblog
+s_web g scaffold Post title:string body:text published:bool
+&lt;span class=&quot;hl-comment&quot;&gt;# routes.stk — add `web_resources &amp;quot;posts&amp;quot;`&lt;/span&gt;
+s_web db migrate
+bin/server
+&lt;span class=&quot;hl-comment&quot;&gt;# open http://localhost:3000/posts&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;s_web g scaffold&lt;/code&gt; writes a model, a migration, a 7-action controller, and 5 ERB views. The generated controller calls model class methods that delegate to the &lt;code&gt;web_model_*&lt;/code&gt; builtins:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Other generators: &lt;code&gt;controller&lt;/code&gt;, &lt;code&gt;model&lt;/code&gt;, &lt;code&gt;migration&lt;/code&gt;, &lt;code&gt;app PRESET&lt;/code&gt;, &lt;code&gt;auth&lt;/code&gt;, &lt;code&gt;admin&lt;/code&gt;, &lt;code&gt;api&lt;/code&gt;, &lt;code&gt;mailer&lt;/code&gt;, &lt;code&gt;job&lt;/code&gt;, &lt;code&gt;channel&lt;/code&gt;, &lt;code&gt;docker&lt;/code&gt;, &lt;code&gt;ci&lt;/code&gt;, &lt;code&gt;pwa&lt;/code&gt;. &lt;code&gt;s_web new&lt;/code&gt; also takes flags that run several of these at once:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Presets include &lt;code&gt;blog&lt;/code&gt;, &lt;code&gt;ecommerce&lt;/code&gt;, &lt;code&gt;saas&lt;/code&gt;, &lt;code&gt;cms&lt;/code&gt;, &lt;code&gt;forum&lt;/code&gt;, &lt;code&gt;crm&lt;/code&gt;, &lt;code&gt;helpdesk&lt;/code&gt; and others. Themes include &lt;code&gt;simple&lt;/code&gt;, &lt;code&gt;dark&lt;/code&gt;, &lt;code&gt;pico&lt;/code&gt;, &lt;code&gt;bootstrap&lt;/code&gt;, &lt;code&gt;tailwind&lt;/code&gt;, and four CSS-only neon themes (&lt;code&gt;cyberpunk&lt;/code&gt;, &lt;code&gt;synthwave&lt;/code&gt;, &lt;code&gt;terminal&lt;/code&gt;, &lt;code&gt;matrix&lt;/code&gt;). &lt;code&gt;--docker&lt;/code&gt;, &lt;code&gt;--ci&lt;/code&gt;, and &lt;code&gt;--pwa&lt;/code&gt; add a multi-stage Dockerfile, a GitHub Actions workflow that runs migrate + boot + a &lt;code&gt;/health&lt;/code&gt; smoke check, and a PWA manifest plus service worker.&lt;/p&gt;
+&lt;h2 id=&quot;shipped-the-runtime&quot;&gt;Shipped: the runtime&lt;/h2&gt;
+&lt;p&gt;Routing is a set of builtins called from &lt;code&gt;config/routes.stk&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-stryke&quot; data-lang=&quot;stryke&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The runtime surface, grouped:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;Request/response&lt;/strong&gt;: &lt;code&gt;web_params&lt;/code&gt;, &lt;code&gt;web_request&lt;/code&gt;, &lt;code&gt;web_render&lt;/code&gt; (html/text/json/template), &lt;code&gt;web_redirect&lt;/code&gt;, &lt;code&gt;web_set_header&lt;/code&gt;, &lt;code&gt;web_status&lt;/code&gt;. An action that calls neither &lt;code&gt;web_render&lt;/code&gt; nor &lt;code&gt;web_redirect&lt;/code&gt; renders &lt;code&gt;app/views/{resource}/{action}.html.erb&lt;/code&gt;.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Templates&lt;/strong&gt;: ERB with &lt;code&gt;&amp;lt;%= %&amp;gt;&lt;/code&gt;, &lt;code&gt;&amp;lt;% %&amp;gt;&lt;/code&gt;, &lt;code&gt;&amp;lt;%# %&amp;gt;&lt;/code&gt;, &lt;code&gt;&amp;lt;%- -%&amp;gt;&lt;/code&gt;, layouts, and &lt;code&gt;web_render_partial&lt;/code&gt;. Control structures can span tags because the engine compiles all segments into one stryke program before running it.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Data&lt;/strong&gt;: SQLite by default (&lt;code&gt;web_db_connect&lt;/code&gt;, &lt;code&gt;web_db_query&lt;/code&gt;, &lt;code&gt;web_db_execute&lt;/code&gt;), the &lt;code&gt;web_model_*&lt;/code&gt; CRUD set, pagination, LIKE search, soft delete, counter caches, single-IN-query eager loading (&lt;code&gt;web_model_with&lt;/code&gt;), and transactions.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Migrations&lt;/strong&gt;: &lt;code&gt;web_create_table&lt;/code&gt;, &lt;code&gt;web_add_column&lt;/code&gt;, &lt;code&gt;web_remove_column&lt;/code&gt;, &lt;code&gt;web_drop_table&lt;/code&gt;, &lt;code&gt;web_migrate&lt;/code&gt;/&lt;code&gt;web_rollback&lt;/code&gt;, tracked in &lt;code&gt;schema_migrations&lt;/code&gt;.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Jobs&lt;/strong&gt;: database-backed queue (&lt;code&gt;web_jobs_init&lt;/code&gt;, &lt;code&gt;web_job_enqueue&lt;/code&gt;/&lt;code&gt;dequeue&lt;/code&gt;/&lt;code&gt;complete&lt;/code&gt;/&lt;code&gt;fail&lt;/code&gt;).&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Security and auth&lt;/strong&gt;: CSRF meta tag, &lt;code&gt;web_security_headers&lt;/code&gt;, &lt;code&gt;web_permit&lt;/code&gt; strong params, cookie sessions and flash, JWT (HS256), TOTP, token-bucket rate limiting, signed time-limited tokens, &lt;code&gt;web_can&lt;/code&gt;.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;APIs&lt;/strong&gt;: &lt;code&gt;/openapi.json&lt;/code&gt;, Swagger UI at &lt;code&gt;/docs&lt;/code&gt;, and Redoc at &lt;code&gt;/docs/redoc&lt;/code&gt; are served from the live route table with no app code. JSON:API envelope helpers and &lt;code&gt;web_bearer_token&lt;/code&gt; are included.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Streaming&lt;/strong&gt;: SSE via &lt;code&gt;web_sse_event&lt;/code&gt; and &lt;code&gt;web_render_stream&lt;/code&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;code&gt;s_web build&lt;/code&gt; generates a Rust wrapper crate that embeds every &lt;code&gt;.stk&lt;/code&gt; file with &lt;code&gt;include_str!&lt;/code&gt;; &lt;code&gt;cargo build --release&lt;/code&gt; inside it produces one binary containing the framework, the app, and statically linked SQLite. The README reports one such build at 136 MB on macOS arm64.&lt;/p&gt;
+&lt;h2 id=&quot;shipped-behavior-that-differs-from-the-design-doc&quot;&gt;Shipped behavior that differs from the design doc&lt;/h2&gt;
+&lt;p&gt;Some shipped pieces are simpler than the doc&amp;#x27;s target form:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Area&lt;/th&gt;&lt;th&gt;Design doc target&lt;/th&gt;&lt;th&gt;Shipped&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;Template output&lt;/td&gt;&lt;td&gt;originally &lt;code&gt;#{ expr }&lt;/code&gt;, compiled AOT via Cranelift&lt;/td&gt;&lt;td&gt;ERB &lt;code&gt;&amp;lt;%= %&amp;gt;&lt;/code&gt;, compiled to a stryke program at request time&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Routing DSL&lt;/td&gt;&lt;td&gt;&lt;code&gt;route :GET, &amp;quot;/&amp;quot;, home#index&lt;/code&gt;, &lt;code&gt;resources :posts&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&lt;code&gt;web_route&lt;/code&gt; / &lt;code&gt;web_resources&lt;/code&gt; / &lt;code&gt;web_root&lt;/code&gt; builtins&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Password storage&lt;/td&gt;&lt;td&gt;Argon2id&lt;/td&gt;&lt;td&gt;SHA-256 + salt (&lt;code&gt;web_password_hash&lt;/code&gt;)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;JSON&lt;/td&gt;&lt;td&gt;simd-json&lt;/td&gt;&lt;td&gt;&lt;code&gt;serde_json&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;ORM&lt;/td&gt;&lt;td&gt;joins, scopes, callbacks&lt;/td&gt;&lt;td&gt;single-table chains; joins/scopes pending&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;The template change is recorded in the doc&amp;#x27;s Resolved Decisions (2026-05-01): ERB replaced &lt;code&gt;#{}&lt;/code&gt; for visual parity with Rails.&lt;/p&gt;
+&lt;h2 id=&quot;not-shipped-yet&quot;&gt;Not shipped yet&lt;/h2&gt;
+&lt;p&gt;From the doc&amp;#x27;s phase list, deferred or not started:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;HTTP/2 via &lt;code&gt;h2&lt;/code&gt; and TLS via &lt;code&gt;rustls&lt;/code&gt;.&lt;/li&gt;
+&lt;li&gt;WebSockets and the Channel abstraction (generators scaffold channel stubs only).&lt;/li&gt;
+&lt;li&gt;glommio + io_uring thread-per-core runtime, per-core sharding.&lt;/li&gt;
+&lt;li&gt;Mailer runtime (SMTP); the generator writes the structure.&lt;/li&gt;
+&lt;li&gt;Polished hot reload, TechEmpower harness, public benchmark dashboard.&lt;/li&gt;
+&lt;li&gt;Phase 3: HTTP/3 default-on, kTLS, custom SIMD HTTP parser, wasm32-wasi edge target.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;code&gt;s_web console&lt;/code&gt; is marked pending a stryke &lt;code&gt;--repl&lt;/code&gt; flag.&lt;/p&gt;
+&lt;h2 id=&quot;performance-targets-not-measurements&quot;&gt;Performance: targets, not measurements&lt;/h2&gt;
+&lt;p&gt;The design doc has a performance table: 500k req/s plaintext for Phase 0, rising to 6M+ for Phase 3, plus cold-start and memory targets. These are design targets. For Phase 0 the doc says the number is &amp;quot;still subject to TechEmpower-style validation&amp;quot;, and the Phase 1 targets are &amp;quot;pending Phase 2 perf work.&amp;quot; No TechEmpower results are published in the repo. Local benchmarks run through &lt;code&gt;s bench&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;The one wall-clock figure in the generator README is about scaffolding, not serving: about 0.45 s to generate and migrate the &lt;code&gt;everything&lt;/code&gt; preset.&lt;/p&gt;
+&lt;p&gt;Source: &lt;code&gt;docs/WEB_FRAMEWORK.md&lt;/code&gt;, &lt;code&gt;stryke_web/README.md&lt;/code&gt;, and &lt;code&gt;strykelang/web.rs&lt;/code&gt; in &lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;strykelang&lt;/a&gt;.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
     <title>Welcome</title>
     <link href="https://menketechnologies.github.io/blog/posts/welcome.html"/>
     <id>https://menketechnologies.github.io/blog/posts/welcome.html</id>
@@ -22,6 +398,365 @@
 &lt;a href=&quot;https://github.com/MenkeTechnologies/zpwr&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zpwr&lt;/a&gt; and the rest of the stack.&lt;/p&gt;
 &lt;p&gt;New posts show up on the &lt;a href=&quot;../index.html&quot;&gt;index&lt;/a&gt; and in the
 &lt;a href=&quot;../feed.xml&quot;&gt;Atom feed&lt;/a&gt;.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
+    <title>zpwr, a Terminal Environment Behind One Verb Dispatcher</title>
+    <link href="https://menketechnologies.github.io/blog/posts/zpwr-verb-dispatcher-terminal-environment.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/zpwr-verb-dispatcher-terminal-environment.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>How zpwr installs, where its files live, and how its single dispatcher command exposes diagnostics, profiling, and snapshot tooling.</summary>
+    <category term="zpwr"/>
+    <category term="zsh"/>
+    <category term="tmux"/>
+    <category term="dotfiles"/>
+    <content type="html">&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/zpwr&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zpwr&lt;/a&gt; is a terminal environment built on zinit. It configures the shell, tmux (ztmux), vim, completion and keybindings from a single repository. The README credits Hashrocket&amp;#x27;s Dotmatrix as the original fork point. The installer sets &lt;a href=&quot;https://github.com/MenkeTechnologies/zshrs&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zshrs&lt;/a&gt; as the login shell; stock zsh remains supported.&lt;/p&gt;
+&lt;p&gt;Most of the environment is reached through one command: &lt;code&gt;zpwr &amp;lt;verb&amp;gt;&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;installing&quot;&gt;Installing&lt;/h2&gt;
+&lt;p&gt;One line:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;sh -c &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;$(curl -fsSL raw.githubusercontent.com/MenkeTechnologies/zpwr/main/install/s)&amp;quot;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;install/s&lt;/code&gt; is a wrapper around the manual path:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;.zpwr/install &amp;amp;&amp;amp; ./zpwrInstall.sh&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The installer confirms what it will install and overwrite before it runs. It builds the Rust toolchain components with cargo in the background, adds zshrs to &lt;code&gt;/etc/shells&lt;/code&gt; and runs &lt;code&gt;chsh&lt;/code&gt;. If zshrs is not on &lt;code&gt;PATH&lt;/code&gt; when cargo finishes, it falls back to stock zsh. Zinit installs plugins on the first shell after install.&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;zpwrInstall.sh&lt;/code&gt; takes these flags:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Flag&lt;/th&gt;&lt;th&gt;Effect&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;-a&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Install all dependencies&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;-c&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Copy just configs&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;-n&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Do not start ztmux at end of installer&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;-s&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Skip main section&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;-h&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Display help&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;-V&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Display script version&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;code&gt;-c&lt;/code&gt; is the minimal install: configs only, no dependencies. The scripts in &lt;code&gt;~/.zpwr/install&lt;/code&gt; can then be run one at a time.&lt;/p&gt;
+&lt;h2 id=&quot;layout&quot;&gt;Layout&lt;/h2&gt;
+&lt;p&gt;Everything lives under &lt;code&gt;~/.zpwr&lt;/code&gt; (the &lt;code&gt;ZPWR&lt;/code&gt; variable). &lt;code&gt;~/.zshrc&lt;/code&gt;, &lt;code&gt;~/.vimrc&lt;/code&gt;, &lt;code&gt;~/.tmux.conf&lt;/code&gt; and the other configs are symlinked into &lt;code&gt;$HOME&lt;/code&gt;. Previous configs are archived under &lt;code&gt;~/.zpwr/local&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;Top-level directories at &lt;code&gt;origin/main&lt;/code&gt;:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Path&lt;/th&gt;&lt;th&gt;Contents&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;autoload/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;autoloaded functions, split by &lt;code&gt;common&lt;/code&gt;, &lt;code&gt;darwin&lt;/code&gt;, &lt;code&gt;linux&lt;/code&gt;, &lt;code&gt;fzf&lt;/code&gt;, &lt;code&gt;comps&lt;/code&gt;, &lt;code&gt;comp_utils&lt;/code&gt;, &lt;code&gt;systemctl&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;env/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;environment and the verb table (&lt;code&gt;env/zpwr.zsh&lt;/code&gt;)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;install/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;installer scripts&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;scripts/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;standalone scripts&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;tests/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;zunit test files&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;man/man1/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&lt;code&gt;zpwr.1&lt;/code&gt;, &lt;code&gt;zpwrall.1&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;tmux/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;tmux configuration&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;local/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;per-user state, git ignored&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;Two files carry user customization and survive &lt;code&gt;zpwr update&lt;/code&gt;:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;~/.zpwr/local/.tokens.sh&lt;/code&gt;, sourced before zsh config and zinit startup&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;~/.zpwr/local/.tokens-post.sh&lt;/code&gt;, sourced after all of it&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Extra zinit plugins go in the post file:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;the-dispatcher&quot;&gt;The dispatcher&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;env/zpwr.zsh&lt;/code&gt; builds a global associative array, &lt;code&gt;ZPWR_VERBS&lt;/code&gt;. Each key is a verb; each value is &lt;code&gt;function=description&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt; time with percentiles &lt;span class=&quot;hl-kw&quot;&gt;and&lt;/span&gt; baseline diff&amp;#x27;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;zpwr&lt;/code&gt; sources that file with the caller&amp;#x27;s arguments on every call. &lt;code&gt;zpwr &amp;lt;tab&amp;gt;&lt;/code&gt; gives grouped menu completion over the same table. &lt;code&gt;zpwr verbs&lt;/code&gt; lists verbs in arb and runs the ones you pick, and &lt;code&gt;zpwr verbsedit&lt;/code&gt; puts them on the command line.&lt;/p&gt;
+&lt;p&gt;Counts from the table at &lt;code&gt;origin/main&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;^]]+)\]=/&lt;span class=&quot;hl-string&quot;&gt;&amp;#x27; | sort -u | wc -l
+# 460
+git show origin/main:env/zpwr.zsh | perl -ne &amp;quot;print \&amp;quot;\$1\n\&amp;quot; if /^\s*ZPWR_VERBS\[[^]]+\]=&amp;#x27;&lt;/span&gt;([^=]+)=/&amp;quot; | sort -u | wc -l
+&lt;span class=&quot;hl-comment&quot;&gt;# 373&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;That is 460 distinct verb names mapped onto 373 backing functions. Several verbs are aliases of each other; &lt;code&gt;wizard&lt;/code&gt; and &lt;code&gt;docs&lt;/code&gt; both run &lt;code&gt;zpwrWizard&lt;/code&gt;. The README also lists 2000+ aliases and 360+ git aliases.&lt;/p&gt;
+&lt;h2 id=&quot;selected-verbs&quot;&gt;Selected verbs&lt;/h2&gt;
+&lt;h3 id=&quot;zpwr-doctor&quot;&gt;zpwr doctor&lt;/h3&gt;
+&lt;p&gt;Scans for stale &lt;code&gt;.zwc&lt;/code&gt; files, zcompdump freshness, duplicate and missing &lt;code&gt;PATH&lt;/code&gt;/&lt;code&gt;FPATH&lt;/code&gt; entries, broken symlinks, invalid named directories, missing dependencies, zinit installation, history files and config symlinks. Output is pass/warn/fail per check, then a summary.&lt;/p&gt;
+&lt;h3 id=&quot;zpwr-bench-zpwr-startup-zpwr-flame&quot;&gt;zpwr bench / zpwr startup / zpwr flame&lt;/h3&gt;
+&lt;p&gt;Three views of startup cost:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;bench&lt;/code&gt; stores its baseline and history in &lt;code&gt;$ZPWR_LOCAL/zpwr-bench-baseline.txt&lt;/code&gt; and &lt;code&gt;$ZPWR_LOCAL/zpwr-bench-history.txt&lt;/code&gt;.&lt;/p&gt;
+&lt;h3 id=&quot;zpwr-snapshot-zpwr-restore&quot;&gt;zpwr snapshot / zpwr restore&lt;/h3&gt;
+&lt;p&gt;&lt;code&gt;zpwr snapshot [name]&lt;/code&gt; writes named directories, aliases, environment variables, history, the directory stack, git repo status, tmux layout and vim sessions to &lt;code&gt;$ZPWR_LOCAL/snapshots/&lt;/code&gt;. Restore can be partial:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Components are &lt;code&gt;hash&lt;/code&gt;, &lt;code&gt;aliases&lt;/code&gt;, &lt;code&gt;env&lt;/code&gt;, &lt;code&gt;tmux&lt;/code&gt;, &lt;code&gt;vim&lt;/code&gt;, &lt;code&gt;history&lt;/code&gt;, &lt;code&gt;dirs&lt;/code&gt;. History is merged, not overwritten.&lt;/p&gt;
+&lt;h3 id=&quot;zpwr-pathaudit-zpwr-lint-zpwr-ports&quot;&gt;zpwr pathaudit / zpwr lint / zpwr ports&lt;/h3&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;pathaudit&lt;/code&gt; checks &lt;code&gt;PATH&lt;/code&gt;, &lt;code&gt;FPATH&lt;/code&gt; and &lt;code&gt;MANPATH&lt;/code&gt; for duplicates, missing directories and world-writable directories.&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;lint&lt;/code&gt; runs &lt;code&gt;zsh -n&lt;/code&gt; on autoloads and env files and &lt;code&gt;shellcheck&lt;/code&gt; on &lt;code&gt;scripts/&lt;/code&gt; and &lt;code&gt;install/&lt;/code&gt;.&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;ports&lt;/code&gt; lists listening TCP ports with process, PID, user and bind address; &lt;code&gt;-k PORT&lt;/code&gt; kills the owner.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2 id=&quot;under-zshrs&quot;&gt;Under zshrs&lt;/h2&gt;
+&lt;p&gt;zshrs implements syntax highlighting, autosuggestions, autopair and history substring search in the shell itself, and ships a native powerlevel10k prompt engine. When &lt;code&gt;$ZSHRS_VERSION&lt;/code&gt; is set, zpwr sets &lt;code&gt;ZPWR_NATIVE_ZLE=true&lt;/code&gt; and skips the four equivalent zsh plugins so widgets are not wrapped twice. zshrs also adds an &lt;code&gt;async_precmd&lt;/code&gt; hook that runs after the prompt is drawn. zpwr moves only the hooks named in &lt;code&gt;ZPWR_PRECMD_ASYNC_HOOKS&lt;/code&gt; there, and the default list is &lt;code&gt;zpwrPrecmd&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;tests-docs-removal&quot;&gt;Tests, docs, removal&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;zpwr test&lt;/code&gt; runs the zunit suite; &lt;code&gt;zpwr testall&lt;/code&gt; includes plugin tests. &lt;code&gt;origin/main&lt;/code&gt; has 149 &lt;code&gt;tests/*.zsh&lt;/code&gt; files.&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;man zpwr&lt;/code&gt; is the quick reference and &lt;code&gt;man zpwrall&lt;/code&gt; is the full verb and variable catalog. Add &lt;code&gt;$ZPWR/man&lt;/code&gt; to &lt;code&gt;MANPATH&lt;/code&gt; first.&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;zpwr updateall&lt;/code&gt; relinks configs, pulls, updates plugins, regenerates caches and updates dependencies.&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;zpwr uninstall&lt;/code&gt; asks for confirmation, restores backups, unlinks configs and deletes the config directories.&lt;/li&gt;
+&lt;/ul&gt;
+</content>
+  </entry>
+  <entry>
+    <title>zsh-more-completions, Layout, Install and How Completions Get In</title>
+    <link href="https://menketechnologies.github.io/blog/posts/zsh-more-completions-layout-install-harvest.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/zsh-more-completions-layout-install-harvest.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>How the zsh-more-completions corpus is split across directories, how its plugin file wires them into fpath, and how new completion files are harvested and checked.</summary>
+    <category term="zsh-more-completions"/>
+    <category term="zsh"/>
+    <category term="completion"/>
+    <category term="compsys"/>
+    <content type="html">&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/zsh-more-completions&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zsh-more-completions&lt;/a&gt; is a zsh plugin made of &lt;code&gt;#compdef&lt;/code&gt; completion files for compsys. The README says most files were first generated from &lt;code&gt;--help&lt;/code&gt; output, man pages and web research, then cleaned and updated by hand, and that many were written by hand from the start.&lt;/p&gt;
+&lt;p&gt;The README also treats the corpus as reference material. Each &lt;code&gt;_command&lt;/code&gt; file uses the same schema: a &lt;code&gt;#compdef&lt;/code&gt; header, then &lt;code&gt;_arguments&lt;/code&gt; / &lt;code&gt;_describe&lt;/code&gt; blocks that list subcommands, flags and arguments with descriptions. You can read a command&amp;#x27;s options from its file without installing the command.&lt;/p&gt;
+&lt;h2 id=&quot;size&quot;&gt;Size&lt;/h2&gt;
+&lt;p&gt;All counts below come from &lt;code&gt;origin/main&lt;/code&gt; at &lt;code&gt;c66e5683dd&lt;/code&gt;. The repo has a stats script, &lt;code&gt;scripts/print-repo-stats.zsh&lt;/code&gt;, that counts &lt;code&gt;_*&lt;/code&gt; files with &lt;code&gt;find -maxdepth 1 -type f&lt;/code&gt; in each completion directory. This tree query counts the same files without a checkout:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;git ls-tree -r --name-only origin/main \
+  | perl -ne &lt;span class=&quot;hl-string&quot;&gt;&amp;#x27;print &amp;quot;$1\n&amp;quot; if m{^([^/]+)/_[^/]*$}&amp;#x27;&lt;/span&gt; | sort | uniq -c&lt;/code&gt;&lt;/pre&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Directory&lt;/th&gt;&lt;th&gt;&lt;code&gt;_*&lt;/code&gt; files&lt;/th&gt;&lt;th&gt;Purpose (README)&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;src/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;8,360&lt;/td&gt;&lt;td&gt;main completions&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;13,128&lt;/td&gt;&lt;td&gt;additional (0-9, a-c)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src2/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;4,497&lt;/td&gt;&lt;td&gt;additional (d-g)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src3/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;3,788&lt;/td&gt;&lt;td&gt;additional (h-l)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src4/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;5,244&lt;/td&gt;&lt;td&gt;additional (m-p)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src5/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;3,717&lt;/td&gt;&lt;td&gt;additional (q-s)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src6/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;3,973&lt;/td&gt;&lt;td&gt;additional (t-z)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src7/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;100&lt;/td&gt;&lt;td&gt;automated generation&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;more_src8/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;100&lt;/td&gt;&lt;td&gt;automated generation&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;man_src/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;3,398&lt;/td&gt;&lt;td&gt;parsed from man pages&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;override_src/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;22&lt;/td&gt;&lt;td&gt;overrides, prepended to &lt;code&gt;fpath&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;architecture_src/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;1,067&lt;/td&gt;&lt;td&gt;cross-architecture toolchains&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;strong&gt;total&lt;/strong&gt;&lt;/td&gt;&lt;td&gt;&lt;strong&gt;47,394&lt;/strong&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;The README headline says 47,398. It also says counts change constantly and should never be edited by hand, and points to the stats script for live numbers.&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;architecture_src/&lt;/code&gt; holds target-prefixed toolchain binaries such as &lt;code&gt;_aarch64-alpine-linux-musl-gcc&lt;/code&gt;. &lt;code&gt;override_src/&lt;/code&gt; is a short list (&lt;code&gt;_git&lt;/code&gt;, &lt;code&gt;_curl&lt;/code&gt;, &lt;code&gt;_whois&lt;/code&gt;, &lt;code&gt;_ztmux&lt;/code&gt;, &lt;code&gt;_zshrs&lt;/code&gt; and others) meant to win over completions found elsewhere on &lt;code&gt;fpath&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;how-the-plugin-loads&quot;&gt;How the plugin loads&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;zsh-more-completions.plugin.zsh&lt;/code&gt; is 18 lines. It does not autoload anything and does not call &lt;code&gt;compinit&lt;/code&gt;. It only edits &lt;code&gt;fpath&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt; ... &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;$1/man_src&amp;quot;&lt;/span&gt; &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;$1/architecture_src&amp;quot;&lt;/span&gt;)&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;override_src&lt;/code&gt; is prepended. Every other directory is appended, after the system completion directories, so a completion shipped with zsh or the OS still wins over the plugin&amp;#x27;s copy. Each directory is added only if it is not already on &lt;code&gt;fpath&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;installing&quot;&gt;Installing&lt;/h2&gt;
+&lt;h3 id=&quot;zinit-readme-recommended&quot;&gt;Zinit (README: recommended)&lt;/h3&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;nocompletions&lt;/code&gt; stops zinit from symlinking every file into &lt;code&gt;~/.zinit/completions&lt;/code&gt;. The plugin&amp;#x27;s own &lt;code&gt;fpath&lt;/code&gt; ordering then applies, so &lt;code&gt;override_src&lt;/code&gt; stays first and system completions stay ahead of the rest.&lt;/p&gt;
+&lt;h3 id=&quot;oh-my-zsh&quot;&gt;Oh My Zsh&lt;/h3&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Add &lt;code&gt;zsh-more-completions&lt;/code&gt; to &lt;code&gt;plugins&lt;/code&gt;. OMZ adds only the plugin root to &lt;code&gt;fpath&lt;/code&gt;, so the README gives a loop to run before OMZ calls &lt;code&gt;compinit&lt;/code&gt;. It adds each &lt;code&gt;*src&lt;/code&gt; directory, putting &lt;code&gt;override&lt;/code&gt; directories first:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;   &lt;span class=&quot;hl-kw&quot;&gt;if&lt;/span&gt; [[ -d &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;$dir&amp;quot;&lt;/span&gt; ]]; &lt;span class=&quot;hl-kw&quot;&gt;then&lt;/span&gt;
+                &lt;span class=&quot;hl-kw&quot;&gt;if&lt;/span&gt; [[ -z &lt;span class=&quot;hl-var&quot;&gt;${fpath&lt;/span&gt;[(r)&lt;span class=&quot;hl-var&quot;&gt;$dir&lt;/span&gt;]} ]];&lt;span class=&quot;hl-kw&quot;&gt;then&lt;/span&gt;
+                    &lt;span class=&quot;hl-kw&quot;&gt;if&lt;/span&gt; [[ &lt;span class=&quot;hl-var&quot;&gt;$dir&lt;/span&gt; = *override* ]]; &lt;span class=&quot;hl-kw&quot;&gt;then&lt;/span&gt;
+                        fpath=(&lt;span class=&quot;hl-var&quot;&gt;$dir&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$fpath&lt;/span&gt;)
+                    &lt;span class=&quot;hl-kw&quot;&gt;else&lt;/span&gt;
+                        fpath=(&lt;span class=&quot;hl-var&quot;&gt;$fpath&lt;/span&gt; &lt;span class=&quot;hl-var&quot;&gt;$dir&lt;/span&gt;)
+                    &lt;span class=&quot;hl-kw&quot;&gt;fi&lt;/span&gt;
+                &lt;span class=&quot;hl-kw&quot;&gt;fi&lt;/span&gt;
+            &lt;span class=&quot;hl-kw&quot;&gt;fi&lt;/span&gt;
+        &lt;span class=&quot;hl-kw&quot;&gt;done&lt;/span&gt;
+    &lt;span class=&quot;hl-kw&quot;&gt;fi&lt;/span&gt;
+&lt;span class=&quot;hl-kw&quot;&gt;done&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;A comment in the plugin file says that under OMZ, &lt;code&gt;compinit&lt;/code&gt; has to run twice: once in OMZ, and once after the plugin file is sourced.&lt;/p&gt;
+&lt;h3 id=&quot;manual&quot;&gt;Manual&lt;/h3&gt;
+&lt;p&gt;Clone the repo and copy the &lt;code&gt;_*&lt;/code&gt; files from the source directories to a directory on your &lt;code&gt;fpath&lt;/code&gt;.&lt;/p&gt;
+&lt;h3 id=&quot;then&quot;&gt;Then&lt;/h3&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The README suggests &lt;code&gt;compinit -C&lt;/code&gt; for faster startup. It skips the security check and loads the cached &lt;code&gt;~/.zcompdump&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;how-completions-are-added&quot;&gt;How completions are added&lt;/h2&gt;
+&lt;p&gt;The &lt;code&gt;scripts/&lt;/code&gt; directory holds the harvesters:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;harvest-apt-completions.py&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;harvest-brew-completions.py&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;harvest-crates-completions.py&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;harvest-gh-releases.py&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;harvest-nix-completions.py&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;harvest-web-completions.py&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;The Homebrew harvester&amp;#x27;s docstring gives the pipeline for each formula:&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;Skip if &lt;code&gt;_&amp;lt;formula&amp;gt;&lt;/code&gt; is already in &lt;code&gt;src/&lt;/code&gt; or &lt;code&gt;more_src/&lt;/code&gt;, or is in &lt;code&gt;blacklist.txt&lt;/code&gt;.&lt;/li&gt;
+&lt;li&gt;Run &lt;code&gt;brew fetch --quiet &amp;lt;formula&amp;gt;&lt;/code&gt; to pull the bottle without installing it.&lt;/li&gt;
+&lt;li&gt;Stream-extract &lt;code&gt;share/zsh/site-functions/_*&lt;/code&gt; from the tarball.&lt;/li&gt;
+&lt;li&gt;Dedup, validate with &lt;code&gt;zsh -nf&lt;/code&gt;, write headers and body to &lt;code&gt;more_src/_&amp;lt;stem&amp;gt;&lt;/code&gt;, and add the stem to the blacklist.&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;&lt;code&gt;blacklist.txt&lt;/code&gt; (51,623 lines at this commit) is the dedup ledger. Once a command name is covered, harvesters skip it. The APT harvester loads and merges the same file.&lt;/p&gt;
+&lt;p&gt;The README&amp;#x27;s harvest list goes past package managers: Nix, Homebrew, APT, Fedora, Alpine, FreeBSD, Kali, crates.io, npm, and source-level work on scientific and infrastructure toolkits. For many of those, it says flag tables were read from each tool&amp;#x27;s &lt;code&gt;usage()&lt;/code&gt; function, argparse setup or man page source.&lt;/p&gt;
+&lt;p&gt;Hand-written files follow the same rules. The files in &lt;code&gt;override_src/&lt;/code&gt; show the format, for example &lt;code&gt;_whois&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;tests&quot;&gt;Tests&lt;/h2&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;GitHub Actions runs the same command on Ubuntu. At this commit, &lt;code&gt;tests/&lt;/code&gt; has 22 &lt;code&gt;.zsh&lt;/code&gt; files with 22,642 &lt;code&gt;@test&lt;/code&gt; entries (&lt;code&gt;git grep -h &amp;#x27;^@test&amp;#x27; origin/main -- &amp;#x27;tests/*.zsh&amp;#x27; | wc -l&lt;/code&gt;). Among the checks:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;every &lt;code&gt;override_src&lt;/code&gt; file starts with &lt;code&gt;#compdef&lt;/code&gt;, and every &lt;code&gt;src&lt;/code&gt; file starts with &lt;code&gt;#compdef&lt;/code&gt; or &lt;code&gt;#autoload&lt;/code&gt; (&lt;code&gt;t-headers.zsh&lt;/code&gt;)&lt;/li&gt;
+&lt;li&gt;conventions such as &lt;code&gt;_files&lt;/code&gt; for filename arguments, bracketed option descriptions, and combined short and long option specs (&lt;code&gt;t-conventions.zsh&lt;/code&gt;)&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;blacklist.txt&lt;/code&gt; exists, is non-empty and has no duplicate lines, and the CI workflow contract holds (&lt;code&gt;t-repo-invariants.zsh&lt;/code&gt;)&lt;/li&gt;
+&lt;/ul&gt;
+</content>
+  </entry>
+  <entry>
+    <title>Inside zshrs - A zsh Port in Rust Split Into Ported Code and Extensions</title>
+    <link href="https://menketechnologies.github.io/blog/posts/zshrs-architecture-overview.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/zshrs-architecture-overview.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>How zshrs is laid out — a mechanically enforced 1:1 port of zsh&#x27;s C source, a separate extensions tree, and a fusevm bytecode core underneath both.</summary>
+    <category term="zshrs"/>
+    <category term="rust"/>
+    <category term="shells"/>
+    <category term="architecture"/>
+    <content type="html">&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/zshrs&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zshrs&lt;/a&gt; is a drop-in zsh replacement written in Rust. Every command — interactive, script, function, sourced file — is compiled to &lt;a href=&quot;https://github.com/MenkeTechnologies/fusevm&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;fusevm&lt;/a&gt; bytecode rather than walked as an AST, and compiled chunks are persisted across processes in rkyv images.&lt;/p&gt;
+&lt;p&gt;This post covers the layout of the codebase and the rules that keep it honest. A follow-up covers the compile pipeline and cache.&lt;/p&gt;
+&lt;h2 id=&quot;workspace&quot;&gt;Workspace&lt;/h2&gt;
+&lt;p&gt;The repository is a 4-crate workspace:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Crate&lt;/th&gt;&lt;th&gt;Role&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zshrs&lt;/code&gt;&lt;/td&gt;&lt;td&gt;The runtime&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zshrs-daemon&lt;/code&gt;&lt;/td&gt;&lt;td&gt;IPC, HTTP, fsnotify, cache maintenance&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;znative&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Published SDK for native Rust plugins&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zshrs-runtime&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Emits &lt;code&gt;libzsh.a&lt;/code&gt; for AOT linking, kept separate so &lt;code&gt;cargo install zshrs&lt;/code&gt; does not build it&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;Shipped binaries live in &lt;code&gt;bins/&lt;/code&gt;: &lt;code&gt;zshrs&lt;/code&gt; (always built), &lt;code&gt;zshrs-recorder&lt;/code&gt; (&lt;code&gt;--features recorder&lt;/code&gt;) and &lt;code&gt;zd&lt;/code&gt; (&lt;code&gt;--features zd&lt;/code&gt;).&lt;/p&gt;
+&lt;h2 id=&quot;ported-code-vs-extensions&quot;&gt;Ported code vs extensions&lt;/h2&gt;
+&lt;p&gt;The runtime source is divided into directories with different rules:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Directory&lt;/th&gt;&lt;th&gt;Rule&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;src/ported/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Strict 1:1 port. Every &lt;code&gt;.rs&lt;/code&gt; mirrors a real upstream &lt;code&gt;Src/&amp;lt;x&amp;gt;.c&lt;/code&gt;; every top-level &lt;code&gt;fn&lt;/code&gt; carries &lt;code&gt;/// Port of &amp;lt;cname&amp;gt;() from Src/&amp;lt;file&amp;gt;.c:NNNN&lt;/code&gt;; no invented helpers; file set frozen.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;src/compsys/ported/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;1:1 mirror of zsh&amp;#x27;s &lt;code&gt;Completion/&lt;/code&gt; tree. Engine functions are ported to Rust; end-user completers are copied as-is and dispatched through a &lt;code&gt;_call_function&lt;/code&gt; bridge.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;src/extensions/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Features zsh C does not have. Must not duplicate or shadow a port.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;src/recorder/&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Feature-gated; every symbol is &lt;code&gt;#[cfg(feature = &amp;quot;recorder&amp;quot;)]&lt;/code&gt;.&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;The boundary is enforced by a test, &lt;code&gt;tests/port_purity.rs&lt;/code&gt;, not by convention. The lexer and parser are direct ports of &lt;code&gt;Src/lex.c&lt;/code&gt; and &lt;code&gt;Src/parse.c&lt;/code&gt;, and zsh&amp;#x27;s AST shape (&lt;code&gt;ZshProgram → ZshList → ZshSublist → ZshPipe → ZshCommand&lt;/code&gt;) is kept as-is. The bytecode compiler, &lt;code&gt;ZshCompiler&lt;/code&gt;, is the original Rust part.&lt;/p&gt;
+&lt;p&gt;Things that live in &lt;code&gt;src/extensions/&lt;/code&gt; include AOT, plugin/script/autoload caches, the worker pool, ZWC helpers, and native line-editor engines ported from fish (syntax highlighting, autosuggestions, history search, autopair).&lt;/p&gt;
+&lt;h2 id=&quot;no-tree-walker&quot;&gt;No tree walker&lt;/h2&gt;
+&lt;p&gt;The tree-walking interpreter has been removed, and tests keep it removed. &lt;code&gt;tests/tree_walker_absent.rs&lt;/code&gt; asserts that the old recursive dispatch functions (&lt;code&gt;execute_simple&lt;/code&gt;, &lt;code&gt;execute_pipeline&lt;/code&gt;, &lt;code&gt;execute_list&lt;/code&gt;, &lt;code&gt;execute_compound&lt;/code&gt;, &lt;code&gt;execute_command_bg&lt;/code&gt;) do not exist in the source, and that &lt;code&gt;execute_command&lt;/code&gt; goes through the parser and &lt;code&gt;ZshCompiler&lt;/code&gt;. &lt;code&gt;tests/no_tree_walker_dispatch.rs&lt;/code&gt; pins the behavior of every construct the deleted walker used to handle.&lt;/p&gt;
+&lt;h2 id=&quot;in-process-execution&quot;&gt;In-process execution&lt;/h2&gt;
+&lt;p&gt;zshrs replaces many &lt;code&gt;fork + exec&lt;/code&gt; paths with in-process work. From the README&amp;#x27;s comparison table:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Operation&lt;/th&gt;&lt;th&gt;zsh&lt;/th&gt;&lt;th&gt;zshrs&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;$(cmd)&lt;/code&gt;&lt;/td&gt;&lt;td&gt;fork + pipe&lt;/td&gt;&lt;td&gt;In-process stdout capture via &lt;code&gt;dup2&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;cat&lt;/code&gt;, &lt;code&gt;head&lt;/code&gt;, &lt;code&gt;sort&lt;/code&gt;, &lt;code&gt;wc&lt;/code&gt;, …&lt;/td&gt;&lt;td&gt;fork + exec&lt;/td&gt;&lt;td&gt;Builtin&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;**/*.rs&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Single-threaded &lt;code&gt;opendir&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Parallel per-subdir descent on a rayon pool&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;compinit&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Synchronous fpath scan&lt;/td&gt;&lt;td&gt;Background scan on the worker pool&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Autoload&lt;/td&gt;&lt;td&gt;Read + parse every time&lt;/td&gt;&lt;td&gt;Bytecode loaded from rkyv&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;48 coreutils commands are builtins — the entries of &lt;code&gt;EXT_BUILTIN_NAMES&lt;/code&gt; in &lt;code&gt;src/extensions/ext_builtins.rs&lt;/code&gt; that GNU coreutils also installs.&lt;/p&gt;
+&lt;p&gt;The worker pool is configured in &lt;code&gt;~/.zshrs/zshrs.toml&lt;/code&gt;:&lt;/p&gt;
+&lt;pre class=&quot;language-toml&quot; data-lang=&quot;toml&quot;&gt;&lt;code&gt;[worker_pool]
+size = 8
+
+[glob]
+parallel_threshold = 32
+recursive_parallel = true&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Extensions built on the pool include &lt;code&gt;async&lt;/code&gt;/&lt;code&gt;await&lt;/code&gt;, &lt;code&gt;pmap&lt;/code&gt;, &lt;code&gt;pgrep&lt;/code&gt;, &lt;code&gt;peach&lt;/code&gt; and &lt;code&gt;barrier&lt;/code&gt;, plus an &lt;code&gt;intercept&lt;/code&gt; builtin for before/after/around advice on any command word:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;intercept after &lt;span class=&quot;hl-string&quot;&gt;&amp;#x27;_*&amp;#x27;&lt;/span&gt; { echo &lt;span class=&quot;hl-string&quot;&gt;&amp;quot;$INTERCEPT_NAME took ${INTERCEPT_MS}ms&amp;quot;&lt;/span&gt; }&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;The &lt;code&gt;{ … }&lt;/code&gt; body form is a zshrs syntax extension; &lt;code&gt;zshrs --zsh&lt;/code&gt; turns it off and rejects it the way &lt;code&gt;/bin/zsh&lt;/code&gt; does.&lt;/p&gt;
+&lt;h2 id=&quot;compatibility-checks&quot;&gt;Compatibility checks&lt;/h2&gt;
+&lt;p&gt;The project measures compatibility against reference shells rather than manuals:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;tests/emulation_parity.rs&lt;/code&gt; compares stdout and exit status of &lt;code&gt;zshrs --X&lt;/code&gt; against the real shell X for the Bourne-family drop-ins (&lt;code&gt;--zsh&lt;/code&gt;, &lt;code&gt;--bash&lt;/code&gt;, &lt;code&gt;--ksh&lt;/code&gt;, &lt;code&gt;--mksh&lt;/code&gt;, &lt;code&gt;--pdksh&lt;/code&gt;, &lt;code&gt;--sh&lt;/code&gt;/&lt;code&gt;--posix&lt;/code&gt;, &lt;code&gt;--dash&lt;/code&gt;, &lt;code&gt;--ash&lt;/code&gt;).&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;bins/parity-fuzz.rs&lt;/code&gt; runs grammar-driven, seed-replayable snippets through both zshrs and zsh and flags divergences.&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;tests/ztst_runner.rs&lt;/code&gt; runs upstream zsh&amp;#x27;s own &lt;code&gt;.ztst&lt;/code&gt; files.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;The README reports test counts measured on 2026-10-27:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Suite&lt;/th&gt;&lt;th&gt;Tests&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;parity&lt;/code&gt;&lt;/td&gt;&lt;td&gt;49,500&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zsh_construct_corpus&lt;/code&gt;&lt;/td&gt;&lt;td&gt;396&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;no_tree_walker_dispatch&lt;/code&gt;&lt;/td&gt;&lt;td&gt;174&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zsh_corpus_via_new_pipeline&lt;/code&gt;&lt;/td&gt;&lt;td&gt;123&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;zsh_parser_probe&lt;/code&gt;&lt;/td&gt;&lt;td&gt;87&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;compile_zsh_smoke&lt;/code&gt;&lt;/td&gt;&lt;td&gt;29&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;tree_walker_absent&lt;/code&gt;&lt;/td&gt;&lt;td&gt;8&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h2 id=&quot;performance-as-reported&quot;&gt;Performance as reported&lt;/h2&gt;
+&lt;p&gt;The README publishes hyperfine results (release build 0.13.27, Darwin arm64) and they are mixed. A few rows, mean milliseconds:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Workload&lt;/th&gt;&lt;th style=&quot;text-align:right&quot;&gt;zshrs&lt;/th&gt;&lt;th style=&quot;text-align:right&quot;&gt;zsh&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;Startup (no-op)&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;7.4&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;4.6&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Arithmetic loop (100000)&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;178.4&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;122.3&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;String append (5000)&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;23.8&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;52.4&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Command substitution (500)&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;90.3&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;268.9&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;External spawn (200)&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;226.1&lt;/td&gt;&lt;td style=&quot;text-align:right&quot;&gt;315.4&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;zshrs is ahead on command substitution, string append and external spawn, and behind on no-op startup, arithmetic loops and function calls in this run. The full table and the harness are in &lt;code&gt;bench/&lt;/code&gt;.&lt;/p&gt;
+&lt;h2 id=&quot;install&quot;&gt;Install&lt;/h2&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;stall zshrs&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Source and docs: &lt;a href=&quot;https://github.com/MenkeTechnologies/zshrs&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;github.com/MenkeTechnologies/zshrs&lt;/a&gt;.&lt;/p&gt;
+</content>
+  </entry>
+  <entry>
+    <title>How zshrs Compiles Shell Code and Caches It in rkyv</title>
+    <link href="https://menketechnologies.github.io/blog/posts/zshrs-bytecode-and-rkyv-cache.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/zshrs-bytecode-and-rkyv-cache.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>The zshrs pipeline from zsh source to fusevm bytecode, its tiered JIT, and the rkyv cache that lets later processes skip lexing, parsing and compiling.</summary>
+    <category term="zshrs"/>
+    <category term="rust"/>
+    <category term="bytecode"/>
+    <category term="caching"/>
+    <content type="html">&lt;p&gt;&lt;a href=&quot;https://github.com/MenkeTechnologies/zshrs&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zshrs&lt;/a&gt; does not interpret an AST. Every command is lexed and parsed by ports of zsh&amp;#x27;s C front end, compiled to &lt;a href=&quot;https://github.com/MenkeTechnologies/fusevm&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;fusevm&lt;/a&gt; bytecode, and run on a VM. Compiled chunks are persisted in rkyv files, so a script or autoload function compiled by one process can be loaded by the next without going through the front end again.&lt;/p&gt;
+&lt;h2 id=&quot;the-pipeline&quot;&gt;The pipeline&lt;/h2&gt;
+&lt;p&gt;From the README:&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Interactive command  ──► lex::zshlex ──► parse::parse ──► ZshCompiler ──► fusevm::Op ──► VM::run()
+Script file (first)  ──► lex::zshlex ──► parse::parse ──► ZshCompiler ──► VM::run() ──► persist rkyv shard
+Script file (cached) ──► index.rkyv + mmap shard ──► deserialize Chunk ──► VM::run()
+Autoload function    ──► autoloads.rkyv ──► deserialize Chunk ──► VM::run()&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;lex::zshlex&lt;/code&gt; and &lt;code&gt;parse::parse&lt;/code&gt; are ports of &lt;code&gt;Src/lex.c&lt;/code&gt; and &lt;code&gt;Src/parse.c&lt;/code&gt;. &lt;code&gt;ZshCompiler&lt;/code&gt; is the only original piece of the front end. It targets the same &lt;code&gt;Op&lt;/code&gt; enum that &lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;strykelang&lt;/a&gt; uses, so both languages share fused superinstructions, extension dispatch and the Cranelift JIT path.&lt;/p&gt;
+&lt;h2 id=&quot;execution-tiers&quot;&gt;Execution tiers&lt;/h2&gt;
+&lt;p&gt;Inside &lt;code&gt;fusevm::VM::run()&lt;/code&gt; a chunk lands on one of several tiers:&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Tier&lt;/th&gt;&lt;th&gt;What&lt;/th&gt;&lt;th&gt;When&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;rkyv image hit&lt;/td&gt;&lt;td&gt;Skip lex/parse/compile&lt;/td&gt;&lt;td&gt;Warm script runs&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Block JIT&lt;/td&gt;&lt;td&gt;Native code via Cranelift&lt;/td&gt;&lt;td&gt;Loops, conditionals&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Linear JIT&lt;/td&gt;&lt;td&gt;Native code via Cranelift&lt;/td&gt;&lt;td&gt;Straight-line arithmetic&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Interpreter&lt;/td&gt;&lt;td&gt;Jump table + superinstructions&lt;/td&gt;&lt;td&gt;Builtins, I/O, strings&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;Enabling the JIT does not mean a given chunk is JIT-compiled. &lt;code&gt;zshrs --tiers&lt;/code&gt; runs a script and then asks fusevm which tier took each chunk, using fusevm&amp;#x27;s own predicates (&lt;code&gt;is_block_eligible&lt;/code&gt;, &lt;code&gt;block_jit_is_compiled&lt;/code&gt;, &lt;code&gt;trace_is_compiled&lt;/code&gt;, &lt;code&gt;find_jit_region&lt;/code&gt;). For chunks that reached neither JIT tier it lists the op kinds responsible:&lt;/p&gt;
+&lt;pre class=&quot;language-sh&quot; data-lang=&quot;sh&quot;&gt;&lt;code&gt;zshrs --tiers script.zsh&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;cache-layout&quot;&gt;Cache layout&lt;/h2&gt;
+&lt;p&gt;Everything lives under &lt;code&gt;$ZSHRS_HOME&lt;/code&gt; (default &lt;code&gt;~/.zshrs/&lt;/code&gt;):&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Path&lt;/th&gt;&lt;th&gt;Contents&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;index.rkyv&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Index: fq_name → shard id, generation, byte offset&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;images/{hash8}-*.rkyv&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Mmap-ready shards (system, completions, plugins, scripts, &lt;code&gt;.zshrc&lt;/code&gt;, …)&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;autoloads.rkyv&lt;/code&gt;&lt;/td&gt;&lt;td&gt;One compiled program per autoloaded function&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;scripts.rkyv&lt;/code&gt;&lt;/td&gt;&lt;td&gt;One chunk per script run; per-event chunks for sourced files&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;code&gt;deparse.rkyv&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Deparsed function bodies (what &lt;code&gt;$functions&lt;/code&gt; prints)&lt;/td&gt;&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;The SQLite files in the same directory — &lt;code&gt;catalog.db&lt;/code&gt; and the views used by &lt;code&gt;dbview&lt;/code&gt; — are read-only mirrors for inspection. The README states they are never consulted for cache hit/miss or execution. &lt;code&gt;history.db&lt;/code&gt; and &lt;code&gt;zshrs_history.db&lt;/code&gt; hold history and are unrelated to bytecode caching.&lt;/p&gt;
+&lt;h2 id=&quot;invalidation-keys&quot;&gt;Invalidation keys&lt;/h2&gt;
+&lt;p&gt;Each store keys its entries on what determines the compiled output:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;Autoloads&lt;/strong&gt;: function name, the resolved fpath directory, a SHA-256 of the exact definition text, and the identity of the &lt;code&gt;zshrs&lt;/code&gt; binary that compiled it. An edited function recompiles. Each entry also records what the &lt;code&gt;$fpath&lt;/code&gt; search found, so a later load can skip the search while the directory is still on &lt;code&gt;fpath&lt;/code&gt; and those files are unchanged.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Scripts&lt;/strong&gt;: path, mtime, build, and the alias/option state the first run started from. A file that changes aliases or options itself is not stored.&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Deparse&lt;/strong&gt;: SHA-256 of the name, body text and the option state the body is re-lexed under, plus the binary identity.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;The autoload cache is bypassed for &lt;code&gt;ksh_autoload&lt;/code&gt;-style bodies and for &lt;code&gt;autoload&lt;/code&gt; without &lt;code&gt;-U&lt;/code&gt;, because there the compiled program is not a function of the file&amp;#x27;s bytes alone.&lt;/p&gt;
+&lt;h2 id=&quot;measured-effect&quot;&gt;Measured effect&lt;/h2&gt;
+&lt;p&gt;The README reports two sets of numbers.&lt;/p&gt;
+&lt;p&gt;For &lt;code&gt;_git&lt;/code&gt; (424 KB of shell): the first &lt;code&gt;git &amp;lt;tab&amp;gt;&lt;/code&gt; in a process goes from &lt;strong&gt;1.06 s to 0.56 s&lt;/strong&gt; once the chunk is cached; decoding the cached 4.6 MB chunk costs &lt;strong&gt;229 µs&lt;/strong&gt; versus &lt;strong&gt;318 ms&lt;/strong&gt; to parse and compile the file.&lt;/p&gt;
+&lt;p&gt;The README&amp;#x27;s cold vs warm comparison (it does not name the workload):&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Cold (cache miss):  717ms  — lex + parse + compile + cache write + execute
+Warm (cache hit):     7ms  — deserialize + execute&lt;/code&gt;&lt;/pre&gt;
+&lt;h2 id=&quot;prewarming&quot;&gt;Prewarming&lt;/h2&gt;
+&lt;p&gt;Autoload entries are written through on first call, one per function actually used. To compile a whole directory up front:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;s            &lt;span class=&quot;hl-comment&quot;&gt;# every dir on $fpath&lt;/span&gt;
+zshrs --prewarm-autoloads DIR ...    &lt;span class=&quot;hl-comment&quot;&gt;# just these&lt;/span&gt;
+zd prewarm [DIR ...]                 &lt;span class=&quot;hl-comment&quot;&gt;# via the daemon&lt;/span&gt;
+prewarm-autoloads [DIR ...]          &lt;span class=&quot;hl-comment&quot;&gt;# as a builtin inside a shell&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Entries already current are skipped by SHA-256, so a re-run after adding one plugin compiles only the new completers. The README gives a sizing budget of roughly 6x the source size: a 13k-completer directory compiles to 165 MB in 35 s on a debug build. &lt;code&gt;zshrs-recorder&lt;/code&gt; runs this pass at the end of every recording (&lt;code&gt;--no-prewarm&lt;/code&gt; skips it); it must not run beside a live ZLE because the parser uses process-global lexer state.&lt;/p&gt;
+&lt;h2 id=&quot;inspecting-the-cache&quot;&gt;Inspecting the cache&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;dbview&lt;/code&gt; reads the mirrors without SQL:&lt;/p&gt;
+&lt;pre class=&quot;language-zsh&quot; data-lang=&quot;zsh&quot;&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Source: &lt;a href=&quot;https://github.com/MenkeTechnologies/zshrs&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;github.com/MenkeTechnologies/zshrs&lt;/a&gt;.&lt;/p&gt;
 </content>
   </entry>
 </feed>

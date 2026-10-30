@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="stryke-fleet is a pure-stryke package that adds transcripted PTY sessions, declarative playbooks, a recipe corpus for interactive CLIs, and parallel multi-target fan-out on top of stryke&#x27;s pty builtins and pmap.">
+  <title>Parallel Expect Playbooks with stryke-fleet — MenkeTechnologies</title>
+  <link rel="canonical" href="https://menketechnologies.github.io/blog/posts/stryke-fleet-parallel-expect-playbooks.html">
+  <link rel="alternate" type="application/atom+xml" title="MenkeTechnologies" href="../feed.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/hud-static.css">
+  <link rel="stylesheet" href="../assets/tutorial.css">
+  <link rel="stylesheet" href="../assets/blog.css">
+</head>
+<body>
+  <div class="app tutorial-app" id="blogApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand"><a href="../index.html">// MENKETECHNOLOGIES — BLOG</a></h1>
+          <nav class="tutorial-crumbs" aria-label="Sections">
+            <a href="../index.html">Posts</a>
+            <span class="sep">/</span>
+            <a href="../archive.html">Archive</a>
+            <span class="sep">/</span>
+            <a href="../tags/index.html">Tags</a>
+            <span class="sep">/</span>
+            <a href="../feed.xml">Feed</a>
+          </nav>
+          <p class="blog-build-line">10 posts · 27 tags</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="../feed.xml">Feed</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/blog" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main blog-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>Parallel Expect Playbooks with stryke-fleet</h2>
+      <p class="tutorial-subtitle"><span class="post-meta"><time datetime="2026-10-30">2026-10-30</time> <span class="sep">·</span> 4 min read <span class="sep">·</span> <a class="post-tag" href="../tags/stryke.html">#stryke</a> <a class="post-tag" href="../tags/pty.html">#pty</a> <a class="post-tag" href="../tags/automation.html">#automation</a></span></p>
+      <article class="tutorial-section post-body">
+<h2 id="what-it-is">What it is</h2>
+<p><a href="https://github.com/MenkeTechnologies/stryke-fleet" target="_blank" rel="noopener noreferrer">stryke-fleet</a> is parallel expect/PTY automation written as a pure-stryke package. It has no <code>[ffi]</code> table and no cdylib; the installed package is <code>stryke.toml</code> plus <code>lib/*.stk</code>.</p>
+<p>The spawn/expect/send loop itself is in <a href="https://github.com/MenkeTechnologies/strykelang" target="_blank" rel="noopener noreferrer">strykelang</a> core: <code>pty_spawn</code>, <code>pty_send</code>, <code>pty_read</code>, <code>pty_expect</code>, <code>pty_expect_table</code>, <code>pty_buffer</code>, <code>pty_alive</code>, <code>pty_eof</code>, <code>pty_close</code>, and <code>pty_interact</code> are builtins, and <code>pmap</code> provides the thread pool. The README describes what core does not provide as policy: what a step is, what a failed run returns, what an ssh login chain looks like, and what shape a transcript has. That policy lives in this package so it can be versioned independently of the language.</p>
+<h2 id="the-four-layers">The four layers</h2>
+<table>
+<thead><tr><th>Module</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>Fleet::Session</code></td><td>PTY session that records every send, match, timeout, and close</td></tr>
+<tr><td><code>Fleet::Playbook</code></td><td>Declarative step lists run in order against one session</td></tr>
+<tr><td><code>Fleet::Recipes</code></td><td>Step-list generators for common interactive CLIs</td></tr>
+<tr><td><code>Fleet::Fanout</code></td><td>One playbook, N targets, one PTY per target in parallel</td></tr>
+</tbody>
+</table>
+<h3 id="session">Session</h3>
+<p><code>Fleet::Session::open</code> wraps a <code>pty_spawn</code> handle in a hashref with a log. <code>send</code>, <code>expect</code>, <code>branch</code>, and <code>close</code> append events, so a failed run returns the full interaction log rather than leaving a stuck process. Additions over the raw builtins include:</p>
+<ul>
+<li><code>send_secret</code>, which transmits the text but logs <code>***</code></li>
+<li><code>send_control</code>, for Ctrl-C, Ctrl-D, and similar</li>
+<li><code>expect_exact</code>, which quotemetas its argument for a literal match</li>
+<li><code>expect_any</code>, which reports which of several prompts arrived</li>
+<li><code>drain</code>, which reads until the child goes idle</li>
+<li><code>transcript_text</code>, which dumps one <code>EVENT&lt;TAB&gt;DATA</code> line per event</li>
+</ul>
+<h3 id="playbook">Playbook</h3>
+<p>A playbook is an arrayref of step hashrefs. The step keys are:</p>
+<ul>
+<li><code>expect</code>, <code>branches</code>, and <code>send</code> (each step needs at least one of these)</li>
+<li><code>send_matched</code>, which sends the result of the matching branch</li>
+<li><code>timeout</code>, in seconds (default 30)</li>
+<li><code>name</code></li>
+<li><code>optional</code></li>
+<li><code>retries</code> and <code>retry_send</code></li>
+<li><code>delay</code></li>
+</ul>
+<p>The first non-optional expect or branch that times out fails the run, and the error names the step. <code>run</code> returns <code>+{ ok, cmd, steps_run, transcript }</code>, plus <code>failed_step</code> and <code>error</code> on failure. <code>dry_run</code> renders the steps without spawning anything.</p>
+<h3 id="recipes">Recipes</h3>
+<p>Recipes return playbook arrayrefs and never spawn anything themselves. That makes them composable with <code>@{...}</code> splices and testable without a network. <code>Fleet::Recipes::names</code> lists 48 generators. They include:</p>
+<ul>
+<li><code>ssh_login</code>, <code>sudo</code>, <code>su</code>, <code>doas</code></li>
+<li><code>psql</code>, <code>mysql</code>, <code>mariadb</code>, <code>redis_cli</code>, <code>mongo</code></li>
+<li><code>telnet_login</code>, <code>sftp</code>, <code>scp</code>, <code>rsync</code></li>
+<li><code>passwd_change</code>, <code>docker_login</code>, <code>cisco_enable</code>, <code>yes_to_all</code></li>
+<li><code>restic</code>, <code>borg</code>, <code>age</code>, <code>vault_login</code>, <code>cryptsetup</code>, <code>bw_unlock</code></li>
+</ul>
+<h3 id="fanout">Fanout</h3>
+<p><code>Fleet::Fanout::run</code> validates the steps once, then calls <code>pmap { Fleet::Playbook::run($_, $steps, $opts) }</code> over the command list. Each target gets its own PTY on its own thread, and results come back in target order. <code>batch</code> caps concurrency at K targets at a time. <code>ssh</code> builds <code>ssh [opts] [user@]HOST</code> commands from a host list.</p>
+<p>Post-processing functions:</p>
+<ul>
+<li><code>partition</code>, <code>count</code>, <code>summarize</code>, and <code>all_ok</code> for pass/fail totals</li>
+<li><code>group_by_error</code>, which buckets failures by error string</li>
+<li><code>group_by_output</code>, which buckets successes by output; its doc comment describes this as config-drift detection</li>
+<li><code>grep_transcript</code>, which answers &quot;which hosts printed X&quot;</li>
+<li><code>retry_failed</code> and <code>retry_until</code>, which re-run only the failures</li>
+</ul>
+<h2 id="usage">Usage</h2>
+<p>A local playbook from <code>examples/local_demo.stk</code>. It needs no network:</p>
+<pre class="language-stryke" data-lang="stryke"><code><span class="hl-kw">use</span> Fleet
+
+<span class="hl-kw">val</span> <span class="hl-var">$r</span> = Fleet::Playbook::run(<span class="hl-string">&quot;sh&quot;</span>, [
+    +{ send   <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;echo fleet-$$\n&quot;</span> },
+    +{ expect <span class="hl-op">=&gt;</span> qr/fleet-\d+/, timeout <span class="hl-op">=&gt;</span> <span class="hl-num">10</span>, name <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;echo back&quot;</span> },
+    +{ send   <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;exit\n&quot;</span> },
+])
+
+p <span class="hl-var">$r</span><span class="hl-op">-&gt;</span>{ok} ? <span class="hl-string">&quot;ok — &quot;</span> . <span class="hl-var">$r</span><span class="hl-op">-&gt;</span>{steps_run} . <span class="hl-string">&quot; steps&quot;</span> : <span class="hl-string">&quot;failed: &quot;</span> . <span class="hl-var">$r</span><span class="hl-op">-&gt;</span>{error}</code></pre>
+<p>The main use case is one login recipe run against many hosts. From <code>examples/parallel_ssh.stk</code>:</p>
+<pre class="language-stryke" data-lang="stryke"><code>h([<span class="hl-var">@hosts</span>], [<span class="hl-var">@steps</span>], +{ ssh_opts <span class="hl-op">=&gt;</span> <span class="hl-string">&quot;-o BatchMode=no&quot;</span> })
+<span class="hl-kw">val</span> <span class="hl-var">$part</span>    = Fleet::Fanout::partition(<span class="hl-var">$results</span>)</code></pre>
+<p><code>ssh_login</code> opens with a branch table. It accepts a host-key <code>(yes/no)?</code> prompt, a password prompt, or a shell prompt directly, and it is marked optional. It then optionally answers a password and expects the shell prompt.</p>
+<p>An installer driven by <code>yes_to_all</code>, from <code>examples/installer_autopilot.stk</code>:</p>
+<pre class="language-stryke" data-lang="stryke"><code></code></pre>
+<h2 id="cli">CLI</h2>
+<p>For one-shot expect/send from the shell:</p>
+<pre class="language-sh" data-lang="sh"><code></code></pre>
+<p>The README directs anything with branches, retries, or more than two steps to a playbook script.</p>
+<h2 id="scope-boundary">Scope boundary</h2>
+<p>The README separates Fleet from stryke&#x27;s <code>cluster([...])</code> + <code>pmap_on</code>, which are persistent SSH worker pools for non-interactive remote compute. Fleet is for sessions that prompt back.</p>
+<h2 id="how-it-s-built-and-tested">How it&#x27;s built and tested</h2>
+<p>Install with <code>s pkg install -g github.com/MenkeTechnologies/stryke-fleet</code>, or <code>s pkg install -g .</code> from a checkout.</p>
+<p><code>t/test_fleet.stk</code> is headless-CI safe by contract. Every PTY assertion drives a local <code>cat</code> or <code>sh</code>, and recipes are tested as data. <code>tests/repo-contract.sh</code> fails the build if any test in <code>t/</code> spawns <code>ssh</code> or calls <code>Fanout::ssh</code>. CI installs a prebuilt stryke release, runs <code>stryke -c</code> on every <code>.stk</code> file in <code>lib/</code>, <code>bin/</code>, <code>t/</code>, and <code>examples/</code>, installs the package, and runs <code>s test t/</code>.</p>
+<p>The package is MIT-licensed.</p>
+      </article>
+      <nav class="tutorial-nav" aria-label="Post navigation">
+        <a class="nav-prev" href="stryke-mcpd-mcp-servers-as-native-binaries.html"><span class="nav-label">Older</span><span class="nav-title">MCP Servers as Single Native Binaries with stryke-mcpd</span></a>
+        <a class="nav-index" href="../index.html"><span class="nav-label">All posts</span></a>
+        <a class="nav-next" href="fusevm-shared-bytecode-vm.html"><span class="nav-label">Newer</span><span class="nav-title">fusevm, the Bytecode VM Under stryke and zshrs</span></a>
+      </nav>
+    </main>
+
+    <footer class="blog-footer">
+      <span>// MenkeTechnologies</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/MenkeTechnologies" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="sep">·</span>
+      <a href="../feed.xml">atom feed</a>
+    </footer>
+  </div>
+
+  <script src="../assets/hud-theme.js"></script>
+</body>
+</html>
