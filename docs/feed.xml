@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>MenkeTechnologies</title>
+  <subtitle>Engineering notes from MenkeTechnologies: zshrs, stryke, zpwr and the rest of the stack.</subtitle>
+  <link href="https://menketechnologies.github.io/blog/feed.xml" rel="self"/>
+  <link href="https://menketechnologies.github.io/blog/"/>
+  <id>https://menketechnologies.github.io/blog/</id>
+  <updated>2026-10-30T00:00:00Z</updated>
+  <author><name>MenkeTechnologies</name></author>
+  <generator>stryke</generator>
+  <entry>
+    <title>Welcome</title>
+    <link href="https://menketechnologies.github.io/blog/posts/welcome.html"/>
+    <id>https://menketechnologies.github.io/blog/posts/welcome.html</id>
+    <updated>2026-10-30T00:00:00Z</updated>
+    <summary>The MenkeTechnologies blog is live.</summary>
+    <category term="meta"/>
+    <content type="html">&lt;p&gt;This is the MenkeTechnologies blog: engineering notes on the projects at
+&lt;a href=&quot;https://github.com/MenkeTechnologies&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;github.com/MenkeTechnologies&lt;/a&gt; —
+&lt;a href=&quot;https://github.com/MenkeTechnologies/zshrs&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zshrs&lt;/a&gt;,
+&lt;a href=&quot;https://github.com/MenkeTechnologies/strykelang&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;stryke&lt;/a&gt;,
+&lt;a href=&quot;https://github.com/MenkeTechnologies/zpwr&quot; target=&quot;_blank&quot; rel=&quot;noopener noreferrer&quot;&gt;zpwr&lt;/a&gt; and the rest of the stack.&lt;/p&gt;
+&lt;p&gt;New posts show up on the &lt;a href=&quot;../index.html&quot;&gt;index&lt;/a&gt; and in the
+&lt;a href=&quot;../feed.xml&quot;&gt;Atom feed&lt;/a&gt;.&lt;/p&gt;
+</content>
+  </entry>
+</feed>

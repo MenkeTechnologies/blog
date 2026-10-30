@@ -1,0 +1,65 @@
+## t/test_site.stk — end-to-end Blog::Site::build into a scratch root.
+##
+## Builds a fixture site (repo stryke.toml + theme, three fixture posts
+## including a draft) and pins: page set, newest-first ordering, older/newer
+## links, tag pages, draft handling, byte-identical rebuilds, stale-page
+## cleanup, the Atom feed, and duplicate-slug rejection.
+
+use Blog::Site
+
+val $root = "/tmp/menketech-blog-test-$$"
+val $out  = "$root/out"
+Blog::Site::mkpath("$root/$_") for qw(posts theme)
+copy("stryke.toml", "$root/stryke.toml")
+copy("theme/$_", "$root/theme/$_") for qw(hud-static.css hud-theme.js tutorial.css blog.css)
+
+fn post_file ($name, $fm, $body) { spurt("$root/posts/$name", "---\n$fm\n---\n$body\n") }
+
+post_file("2026-01-01-first.md",  "title: First\ndate: 2026-01-01\ntags: [a]", "one")
+post_file("2026-02-01-second.md", "title: Second & <More>\ndate: 2026-02-01\ntags: [a, b]\nsummary: S2", "two")
+post_file("2025-12-31-old.md",    "title: Old\ndate: 2025-12-31", "zero")
+post_file("2026-03-01-wip.md",    "title: WIP\ndate: 2026-03-01\ndraft: true", "draft")
+
+val $n = Blog::Site::build($root, $out)
+assert_eq $n, 4 + 6 + 3 + 2, "file count: 4 assets + 6 pages + 3 posts + 2 tags"
+assert_ok (-f "$out/.nojekyll"), ".nojekyll written (Pages must not run Jekyll)"
+assert_ok !(-e "$out/posts/wip.html"), "draft excluded by default"
+
+val $index = slurp("$out/index.html")
+assert_match qr{posts/second\.html.*posts/first\.html.*posts/old\.html}s, $index, "index lists newest first"
+assert_contains $index, "Second &amp; &lt;More&gt;", "titles are HTML-escaped"
+assert_contains $index, "3 posts · 2 tags", "header stats count published posts"
+assert_contains $index, qq{<script src="assets/hud-theme.js"></script>}, "HUD script linked at root depth"
+
+val $first = slurp("$out/posts/first.html")
+assert_contains $first, qq{href="old.html"}, "post links to older neighbour"
+assert_contains $first, qq{href="second.html"}, "post links to newer neighbour"
+assert_contains $first, qq{href="../assets/hud-static.css"}, "post pages link assets one level up"
+assert_contains slurp("$out/posts/old.html"), qq{nav-stub nav-prev}, "oldest post has no older link"
+
+assert_contains slurp("$out/tags/a.html"), "2 posts tagged", "tag page counts its posts"
+assert_match qr{"a\.html".*"b\.html"}s, slurp("$out/tags/index.html"), "tag index: most-used tag first"
+assert_contains slurp("$out/archive.html"), "<h2>2025</h2>", "archive groups by year"
+assert_contains slurp("$out/404.html"), qq{href="/blog/assets/blog.css"}, "404 uses absolute asset paths"
+
+val $feed = slurp("$out/feed.xml")
+assert_contains $feed, "<updated>2026-02-01T00:00:00Z</updated>", "feed updated = newest post date"
+assert_contains $feed, "<category term=\"b\"/>", "feed carries tags as categories"
+assert_ok $feed !~ /WIP/, "feed excludes drafts"
+
+# Byte-identical rebuild — CI's stale-docs check depends on this.
+my %before = map { $_ => slurp($_) } glob("$out/*.html"), glob("$out/posts/*.html"), glob("$out/tags/*.html"), "$out/feed.xml"
+Blog::Site::build($root, $out)
+assert_eq scalar(grep { slurp($_) ne $before{$_} } keys %before), 0, "rebuild is byte-identical"
+
+# Drafts flag; then removing a post deletes its stale page.
+Blog::Site::build($root, $out, 1)
+assert_ok (-f "$out/posts/wip.html"), "--drafts includes draft posts"
+unlink "$root/posts/2026-03-01-wip.md"
+Blog::Site::build($root, $out)
+assert_ok !(-e "$out/posts/wip.html"), "page of a removed post is deleted"
+
+post_file("2026-04-01-first.md", "title: Dup\ndate: 2026-04-01", "dup")
+assert_dies fn { Blog::Site::build($root, $out) }, "duplicate slug dies"
+
+system("rm", "-rf", $root)

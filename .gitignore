@@ -1,0 +1,8 @@
+target/
+stryke.lock
+.DS_Store
+
+# Override the global `docs/` ignore — docs/ here is the generated site
+# that GitHub Pages serves from main.
+!docs/
+!docs/**

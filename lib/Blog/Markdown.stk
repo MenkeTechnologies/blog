@@ -1,0 +1,223 @@
+## lib/Blog/Markdown.stk — `use Blog::Markdown`
+##
+## Block + inline Markdown → HTML for blog posts. Covers the subset posts
+## actually use: ATX headings (with slug ids), paragraphs, fenced code
+## (stryke/perl/sh blocks are syntax-highlighted), blockquotes (nested),
+## ordered + unordered lists (nested by indentation), GFM pipe tables,
+## horizontal rules, images, links, autolinks, code spans, bold, italic,
+## strikethrough. Raw HTML is never passed through — every byte of source
+## text is escaped, so a post cannot inject markup into the page.
+##
+## The core `markdown_to_html` / `web_markdown` builtins (stryke v0.17.60)
+## drop ordered lists, tables, images and multi-line blockquotes, which is
+## why this renderer exists.
+
+package Blog::Markdown
+
+use Blog::Highlight
+
+# Sentinel that brackets stash indices during inline rendering. A control
+# char can never survive into output: html_encode leaves it alone, and the
+# final pass replaces every bracketed index with its stashed HTML.
+val $STASH = chr(1)
+
+## Absolute http(s) links open in a new tab; relative links stay in-site.
+fn Blog::Markdown::link_tag ($text, $href) {
+    return qq{<a href="$href">$text</a>} unless $href =~ /^https?:/
+    qq{<a href="$href" target="_blank" rel="noopener noreferrer">$text</a>}
+}
+
+## Bold / italic / strikethrough on already-escaped text.
+fn Blog::Markdown::emphasis ($s) {
+    $s =~ s/\*\*(?!\s)(.+?)(?<!\s)\*\*/<strong>$1<\/strong>/g
+    $s =~ s/(?<![\w*])\*(?![\s*])(.+?)(?<![\s*])\*(?![\w*])/<em>$1<\/em>/g
+    $s =~ s/(?<![\w_])_(?![\s_])(.+?)(?<![\s_])_(?![\w_])/<em>$1<\/em>/g
+    $s =~ s/~~(?!\s)(.+?)(?<!\s)~~/<del>$1<\/del>/g
+    $s
+}
+
+## Render one line (or a joined run of lines) of inline markup.
+## Code spans, autolinks, images and links are rendered first and parked in
+## @stash so emphasis can never rewrite their URLs or attributes.
+fn Blog::Markdown::inline ($s) {
+    my @stash
+    $s =~ s/`([^`]+)`/push @stash, "<code>" . html_encode($1) . "<\/code>"; $STASH . (scalar(@stash) - 1) . $STASH/ge
+    $s =~ s/<(https?:\/\/[^>\s]+)>/push @stash, Blog::Markdown::link_tag(html_encode($1), html_encode($1)); $STASH . (scalar(@stash) - 1) . $STASH/ge
+    $s = html_encode($s)
+    $s =~ s/!\[([^\]]*)\]\(([^)\s]+)\)/push @stash, qq{<img src="$2" alt="$1" loading="lazy">}; $STASH . (scalar(@stash) - 1) . $STASH/ge
+    $s =~ s/\[([^\]]+)\]\(([^)\s]+)\)/push @stash, Blog::Markdown::link_tag(Blog::Markdown::emphasis($1), $2); $STASH . (scalar(@stash) - 1) . $STASH/ge
+    $s = Blog::Markdown::emphasis($s)
+    # Stashed HTML can itself hold sentinels (a code span inside link text).
+    1 while $s =~ s/$STASH(\d+)$STASH/$stash[$1]/ge
+    $s
+}
+
+## True when $line opens a block that interrupts a paragraph.
+fn Blog::Markdown::starts_block ($line) {
+    return 1 if $line =~ /^\s{0,3}(```|~~~)/
+    return 1 if $line =~ /^\s{0,3}#{1,6}\s/
+    return 1 if $line =~ /^\s{0,3}>/
+    return 1 if $line =~ /^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/
+    return 1 if $line =~ /^\s*(?:[-*+]|\d{1,9}[.)])\s+\S/
+    0
+}
+
+fn Blog::Markdown::table_cells ($line) {
+    $line =~ s/^\s*\|//
+    $line =~ s/\|\s*$//
+    map { trim($_) } split /\|/, $line, -1
+}
+
+## Render a list starting at $lines[$i]. Returns (html, next index).
+fn Blog::Markdown::render_list ($lines, $i) {
+    $lines->[$i] =~ /^(\s*)([-*+]|\d{1,9}[.)])\s+/
+    val $base    = length $1
+    val $ordered = $2 =~ /\d/ ? 1 : 0
+    val $start   = $ordered ? int($2) : 1
+    my @items
+    my $n = scalar @$lines
+    while ($i < $n) {
+        my $l = $lines->[$i]
+        if ($l =~ /^(\s*)([-*+]|\d{1,9}[.)])(\s+)(.*)$/ && length($1) == $base && (($2 =~ /\d/ ? 1 : 0) == $ordered)) {
+            push @items, [$4]
+            $i++
+            next
+        }
+        if ($l =~ /^\s*$/) {
+            # A blank line continues the list only when indented content follows.
+            my $j = $i + 1
+            $j++ while $j < $n && $lines->[$j] =~ /^\s*$/
+            last if $j >= $n
+            if ($lines->[$j] =~ /^(\s*)/ && length($1) > $base) {
+                push @{ $items[-1] }, "" for $i .. $j - 1
+                $i = $j
+                next
+            }
+            last
+        }
+        if (@items && $l =~ /^(\s*)\S/ && length($1) > $base) {
+            push @{ $items[-1] }, $l
+            $i++
+            next
+        }
+        # Lazy continuation of the item's paragraph.
+        if (@items && !Blog::Markdown::starts_block($l)) {
+            push @{ $items[-1] }, $l
+            $i++
+            next
+        }
+        last
+    }
+    val $tag  = $ordered ? "ol" : "ul"
+    my $html = $ordered && $start != 1 ? qq{<$tag start="$start">\n} : "<$tag>\n"
+    for my $item (@items) {
+        my @body = @$item
+        # Dedent continuation lines by their common indent.
+        my $indent = -1
+        for my $k (1 .. $#body) {
+            next if $body[$k] =~ /^\s*$/
+            $body[$k] =~ /^(\s*)/
+            $indent = length $1 if $indent < 0 || length($1) < $indent
+        }
+        if ($indent > 0) {
+            for my $k (1 .. $#body) { $body[$k] = substr($body[$k], $indent) if length($body[$k]) >= $indent }
+        }
+        my $inner = Blog::Markdown::to_html(join("\n", @body))
+        # Tight item: a lone paragraph followed by optional nested blocks.
+        $inner =~ s/\A<p>(.*?)<\/p>\n/$1\n/s unless join("\n", @body) =~ /\n\s*\n/
+        $inner =~ s/\n+\z//
+        $html .= "<li>$inner</li>\n"
+    }
+    ($html . "</$tag>\n", $i)
+}
+
+## Render a full Markdown document to an HTML fragment.
+fn Blog::Markdown::to_html ($md) {
+    $md =~ s/\r//g
+    $md =~ s/\t/    /g
+    my @lines = split /\n/, $md, -1
+    my $n = scalar @lines
+    my $out = ""
+    my $i = 0
+    while ($i < $n) {
+        my $l = $lines[$i]
+        if ($l =~ /^\s*$/) { $i++; next }
+
+        if ($l =~ /^\s{0,3}(```+|~~~+)\s*([\w+#.-]*)/) {
+            val $fence = $1
+            val $lang  = lc $2
+            my @code
+            $i++
+            while ($i < $n && $lines[$i] !~ /^\s{0,3}\Q$fence\E\s*$/) { push @code, $lines[$i]; $i++ }
+            $i++
+            val $body = Blog::Highlight::code(join("\n", @code), $lang)
+            val $attr = length $lang ? qq{ class="language-$lang" data-lang="$lang"} : ""
+            $out .= "<pre$attr><code>$body</code></pre>\n"
+            next
+        }
+
+        if ($l =~ /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/) {
+            val $level = length $1
+            val $text  = $2
+            val $id    = slugify($text =~ s/[`*_~]//gr)
+            $out .= qq{<h$level id="$id">} . Blog::Markdown::inline($text) . "</h$level>\n"
+            $i++
+            next
+        }
+
+        if ($l =~ /^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/) {
+            $out .= "<hr>\n"
+            $i++
+            next
+        }
+
+        if ($l =~ /^\s{0,3}>/) {
+            my @quote
+            while ($i < $n && $lines[$i] =~ /^\s{0,3}>\s?(.*)$/) { push @quote, $1; $i++ }
+            $out .= "<blockquote>\n" . Blog::Markdown::to_html(join("\n", @quote)) . "</blockquote>\n"
+            next
+        }
+
+        if ($l =~ /\|/ && $i + 1 < $n && $lines[$i + 1] =~ /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/) {
+            my @head = Blog::Markdown::table_cells($l)
+            my @align = map { /^:-+:$/ ? "center" : /-:$/ ? "right" : /^:/ ? "left" : "" } Blog::Markdown::table_cells($lines[$i + 1])
+            $i += 2
+            my $t = "<table>\n<thead><tr>"
+            for my $c (0 .. $#head) {
+                val $a = $align[$c] ? qq{ style="text-align:$align[$c]"} : ""
+                $t .= "<th$a>" . Blog::Markdown::inline($head[$c]) . "</th>"
+            }
+            $t .= "</tr></thead>\n<tbody>\n"
+            while ($i < $n && $lines[$i] =~ /\|/ && $lines[$i] !~ /^\s*$/) {
+                my @cells = Blog::Markdown::table_cells($lines[$i])
+                $t .= "<tr>"
+                for my $c (0 .. $#head) {
+                    val $a = $align[$c] ? qq{ style="text-align:$align[$c]"} : ""
+                    $t .= "<td$a>" . Blog::Markdown::inline($cells[$c] // "") . "</td>"
+                }
+                $t .= "</tr>\n"
+                $i++
+            }
+            $out .= $t . "</tbody>\n</table>\n"
+            next
+        }
+
+        if ($l =~ /^\s*(?:[-*+]|\d{1,9}[.)])\s+\S/) {
+            my ($html, $next) = Blog::Markdown::render_list(\@lines, $i)
+            $out .= $html
+            $i = $next
+            next
+        }
+
+        my @para = (trim($l))
+        $i++
+        while ($i < $n && $lines[$i] !~ /^\s*$/ && !Blog::Markdown::starts_block($lines[$i])) {
+            push @para, trim($lines[$i])
+            $i++
+        }
+        $out .= "<p>" . Blog::Markdown::inline(join("\n", @para)) . "</p>\n"
+    }
+    $out
+}
+
+1

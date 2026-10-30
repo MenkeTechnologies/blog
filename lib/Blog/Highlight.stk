@@ -1,0 +1,45 @@
+## lib/Blog/Highlight.stk — `use Blog::Highlight`
+##
+## Build-time syntax highlighting for fenced code blocks. One \G-anchored
+## tokenizer pass per block; each token is HTML-escaped and wrapped in a
+## `<span class="hl-*">` whose colour comes from the active HUD scheme
+## (theme/blog.css). No client-side JS. Languages without a lexer here are
+## emitted escaped and uncoloured.
+
+package Blog::Highlight
+
+val %KEYWORDS = map { $_ => 1 } qw(
+    fn sub val var my our local use package return if elsif else unless
+    while until for foreach last next redo do eval die match struct class
+    enum trait impl extends pub priv async await spawn typed and or not
+    in then fi done case esac function export
+)
+
+val %LEXED = map { $_ => 1 } qw(stryke stk perl pl sh bash zsh shell)
+
+fn Blog::Highlight::span ($class, $text) {
+    qq{<span class="hl-$class">} . html_encode($text) . "</span>"
+}
+
+## Highlight $src as $lang. Returns escaped HTML.
+fn Blog::Highlight::code ($src, $lang) {
+    return html_encode($src) unless $LEXED{$lang}
+    my $out = ""
+    while (1) {
+        if ($src =~ /\G(#[^\n]*)/gc)                          { $out .= Blog::Highlight::span("comment", $1); next }
+        if ($src =~ /\G("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/gc) { $out .= Blog::Highlight::span("string", $1); next }
+        if ($src =~ /\G([\$\@%]\{?\^?[\w:]+\}?|\$_|\@_|\$\d)/gc) { $out .= Blog::Highlight::span("var", $1); next }
+        if ($src =~ /\G(\d[\d_]*(?:\.\d+)?)/gc)               { $out .= Blog::Highlight::span("num", $1); next }
+        if ($src =~ /\G(\|>|~>|=>|->|<=>|::)/gc)              { $out .= Blog::Highlight::span("op", $1); next }
+        if ($src =~ /\G([A-Za-z_][\w:]*)/gc) {
+            val $w = $1
+            $out .= $KEYWORDS{$w} ? Blog::Highlight::span("kw", $w) : html_encode($w)
+            next
+        }
+        if ($src =~ /\G(\s+|.)/gcs) { $out .= html_encode($1); next }
+        last
+    }
+    $out
+}
+
+1

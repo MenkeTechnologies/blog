@@ -1,0 +1,106 @@
+## lib/Blog/Site.stk — `use Blog::Site`
+##
+## The generator: read the `[blog]` table from stryke.toml, parse every
+## posts/*.md in parallel (pmap), sort newest-first, and write the static
+## site. Output is a pure function of the inputs — no build timestamps — so
+## CI can rebuild and `git diff --exit-code docs/` to catch a stale commit.
+##
+## Layout written under $out:
+##   index.html  archive.html  404.html  feed.xml  .nojekyll
+##   posts/<slug>.html   tags/index.html   tags/<tag>.html
+##   assets/{hud-static.css,hud-theme.js,tutorial.css,blog.css}
+
+package Blog::Site
+
+use Blog::Post
+use Blog::Page
+
+val @ASSETS  = qw(hud-static.css hud-theme.js tutorial.css blog.css)
+
+## `mkdir -p`: core `mkdir` creates one level only.
+fn Blog::Site::mkpath ($dir) {
+    my $path = $dir =~ m{^/} ? "" : "."
+    for my $part (grep { length } split m{/}, $dir) {
+        $path .= "/$part"
+        mkdir $path unless -d $path
+    }
+    die "blog: cannot create $dir\n" unless -d $dir
+}
+
+fn Blog::Site::write ($path, $content) {
+    spurt($path, $content)
+}
+
+## Site config from stryke.toml [blog] plus derived fields.
+fn Blog::Site::config ($root) {
+    val $manifest = from_toml(slurp("$root/stryke.toml"))
+    val $blog     = $manifest->{blog} // die "blog: $root/stryke.toml: missing [blog] table\n"
+    for my $k (qw(title tagline description base_url repo author)) {
+        die "blog: stryke.toml: [blog] missing `$k`\n" unless length($blog->{$k} // "")
+    }
+    my %site = %$blog
+    $site{base_url} =~ s{/+$}{}
+    $site{base_path} = $site{base_url} =~ m{^https?://[^/]+(/.*)?$} ? ($1 // "") : ""
+    $site{feed_limit} //= 20
+    \%site
+}
+
+## Parse every post under $root/posts. Drafts are dropped unless $drafts.
+## Returns posts sorted newest-first (ties broken by slug for stable output).
+fn Blog::Site::load_posts ($root, $drafts = 0) {
+    val @files = sort glob("$root/posts/*.md")
+    my @posts = grep { $drafts || !$_->{draft} } pmap { Blog::Post::parse($_) } @files
+    my %seen
+    for my $p (@posts) {
+        die "blog: duplicate slug `$p->{slug}`: $seen{$p->{slug}} and $p->{source}\n" if $seen{$p->{slug}}
+        $seen{$p->{slug}} = $p->{source}
+    }
+    sort { $b->{date} cmp $a->{date} || $a->{slug} cmp $b->{slug} } @posts
+}
+
+## Group posts by tag → [[tag, [posts]], ...], most-used tag first.
+fn Blog::Site::tags (@posts) {
+    my %by
+    for my $p (@posts) { push @{ $by{$_} }, $p for @{ $p->{tags} } }
+    map { [$_, $by{$_}] } sort { scalar(@{ $by{$b} }) <=> scalar(@{ $by{$a} }) || $a cmp $b } keys %by
+}
+
+## Build the site from $root into $out. Returns the number of files written.
+fn Blog::Site::build ($root, $out, $drafts = 0) {
+    val $site  = Blog::Site::config($root)
+    val @posts = Blog::Site::load_posts($root, $drafts)
+    val @tags  = Blog::Site::tags(@posts)
+    $site->{post_count} = scalar @posts
+    $site->{tag_count}  = scalar @tags
+
+    Blog::Site::mkpath("$out/$_") for qw(posts tags assets)
+    # Remove pages for posts/tags that no longer exist. (`unlink LIST` is a
+    # no-op in stryke v0.17.60; one call per file works.)
+    unlink $_ for glob("$out/posts/*.html"), glob("$out/tags/*.html")
+
+    my $n = 0
+    for my $asset (@ASSETS) {
+        copy("$root/theme/$asset", "$out/assets/$asset") or die "blog: cannot copy theme/$asset\n"
+        $n++
+    }
+    Blog::Site::write("$out/.nojekyll", "")
+    Blog::Site::write("$out/index.html", Blog::Page::index($site, \@posts))
+    Blog::Site::write("$out/archive.html", Blog::Page::archive($site, \@posts))
+    Blog::Site::write("$out/404.html", Blog::Page::not_found($site))
+    Blog::Site::write("$out/feed.xml", Blog::Page::feed($site, \@posts, $site->{feed_limit}))
+    Blog::Site::write("$out/tags/index.html", Blog::Page::tag_index($site, \@tags))
+    $n += 6
+    for my $i (0 .. $#posts) {
+        val $newer = $i > 0 ? $posts[$i - 1] : undef
+        val $older = $i < $#posts ? $posts[$i + 1] : undef
+        Blog::Site::write("$out/posts/$posts[$i]{slug}.html", Blog::Page::post($site, $posts[$i], $newer, $older))
+        $n++
+    }
+    for my $t (@tags) {
+        Blog::Site::write("$out/tags/" . slugify($t->[0]) . ".html", Blog::Page::tag($site, $t->[0], $t->[1]))
+        $n++
+    }
+    $n
+}
+
+1

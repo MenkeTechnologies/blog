@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Parse every .stk file, run the t/ suite, then rebuild the site and fail
+  # if the committed docs/ differs — GitHub Pages serves docs/ from main, so
+  # a stale commit would publish pages that don't match posts/. stryke comes
+  # from strykelang's latest release tarball (no cargo install on the runner).
+  stryke:
+    name: Stryke parse + tests + docs freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stryke from latest GitHub release
+        run: |
+          set -euo pipefail
+          TAG=$(gh release view --repo MenkeTechnologies/strykelang \
+              --json tagName --jq '.tagName')
+          ASSET="stryke-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          gh release download "${TAG}" --repo MenkeTechnologies/strykelang \
+              --pattern "${ASSET}" --output /tmp/stryke.tar.gz
+          mkdir -p "${HOME}/.local/bin"
+          tar -C "${HOME}/.local/bin" -xzf /tmp/stryke.tar.gz
+          chmod +x "${HOME}/.local/bin"/{stryke,st,s} 2>/dev/null || true
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          "${HOME}/.local/bin/stryke" --version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Syntax-check every .stk file
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in *.stk lib/Blog/*.stk t/*.stk; do
+              out=$(stryke -c "$f" 2>&1)
+              if [[ "$out" == *"syntax OK"* ]]; then
+                  echo "OK   $f"
+              else
+                  echo "FAIL $f"; printf '%s\n' "$out" | head -5
+                  fail=1
+              fi
+          done
+          exit $fail
+      - name: Tests
+        run: stryke test t/
+      - name: docs/ matches posts/
+        run: |
+          set -euo pipefail
+          stryke build.stk
+          git status --porcelain -- docs
+          git diff --exit-code -- docs
+          test -z "$(git status --porcelain -- docs)"
+
+  html-gates:
+    name: HTML gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: target=_blank links carry rel=noopener
+        run: |
+          ! grep -rnE 'target="_blank"' docs --include='*.html' | grep -v 'rel="noopener noreferrer"'
+      - name: No inline event handlers
+        run: |
+          ! grep -rnE '\son[a-z]+="' docs --include='*.html'

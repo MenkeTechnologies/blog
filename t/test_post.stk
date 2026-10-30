@@ -1,0 +1,31 @@
+## t/test_post.stk — Blog::Post front matter, slugs, validation.
+
+use Blog::Post
+
+fn post ($fm, $body = "body text") { Blog::Post::parse("posts/2026-01-02-My Post.md", "---\n$fm\n---\n$body") }
+
+val $p = post("title: \"Colon: inside\"\ndate: 2026-01-02\ntags: [Stryke, web, stryke]\nsummary: s\n# comment line")
+assert_eq $p->{title}, "Colon: inside", "quoted title keeps its colon"
+assert_eq $p->{date}, "2026-01-02", "date"
+assert_eq $p->{year}, "2026", "year derived from date"
+assert_eq join(",", @{ $p->{tags} }), "stryke,web", "tags lowercased + de-duplicated in order"
+assert_eq $p->{slug}, "my-post", "slug: date prefix stripped, slugified"
+assert_eq $p->{draft}, 0, "draft defaults to 0"
+assert_eq $p->{html}, "<p>body text</p>\n", "body rendered"
+
+assert_eq join(",", @{ post("title: t\ndate: 2026-01-02\ntags: a, b")->{tags} }), "a,b", "bare comma tag list"
+assert_eq scalar @{ post("title: t\ndate: 2026-01-02")->{tags} }, 0, "no tags → empty list"
+assert_eq post("title: t\ndate: 2026-01-02\ndraft: true")->{draft}, 1, "draft: true"
+
+# Reading time: code blocks excluded, rounded up, minimum 1.
+val $words = join " ", ("w") x 221
+val $long = post("title: t\ndate: 2026-01-02", "$words\n\n```\n" . join(" ", ("c") x 500) . "\n```\n")
+assert_eq $long->{words}, 221, "word count excludes fenced code"
+assert_eq $long->{minutes}, 2, "221 words → 2 min (rounded up)"
+assert_eq post("title: t\ndate: 2026-01-02", "")->{minutes}, 1, "empty body → 1 min"
+
+assert_dies fn { Blog::Post::parse("x.md", "no front matter") }, "missing front matter dies"
+assert_dies fn { post("date: 2026-01-02") }, "missing title dies"
+assert_dies fn { post("title: t\ndate: 2026-1-2") }, "non-padded date dies"
+assert_dies fn { post("title: t\ndate: 2026-13-01") }, "month 13 dies"
+assert_dies fn { post("title: t\ndate: 2026-01-02\n:bad") }, "malformed front matter line dies"

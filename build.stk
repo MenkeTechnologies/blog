@@ -1,0 +1,22 @@
+#!/usr/bin/env stryke
+## build.stk — generate the static blog into docs/ (GitHub Pages source).
+##
+##   s build.stk                 # posts/*.md → docs/
+##   s build.stk --out DIR       # write somewhere else
+##   s build.stk --drafts        # include `draft: true` posts
+##
+## Run from the repo root: modules resolve from ./lib.
+
+use Blog::Site
+
+my $out    = "docs"
+my $drafts = 0
+while (@ARGV) {
+    my $arg = shift @ARGV
+    if ($arg eq "--out")       { $out = shift @ARGV // die "blog: --out needs a directory\n" }
+    elsif ($arg eq "--drafts") { $drafts = 1 }
+    else                       { die "blog: unknown argument: $arg\n" }
+}
+
+my $n = Blog::Site::build(".", $out, $drafts)
+p "blog: wrote $n files to $out/"

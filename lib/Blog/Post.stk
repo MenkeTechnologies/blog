@@ -1,0 +1,81 @@
+## lib/Blog/Post.stk — `use Blog::Post`
+##
+## One Markdown file → one post hashref. A post file is front matter
+## between `---` fences followed by the Markdown body:
+##
+##   ---
+##   title: Shipping the blog
+##   date: 2026-10-30
+##   tags: [stryke, web]
+##   summary: One line shown on the index and in the feed.
+##   draft: false
+##   ---
+##   Body in Markdown.
+##
+## `title` and `date` (YYYY-MM-DD) are required. The slug is the file name
+## minus `.md` and minus an optional `YYYY-MM-DD-` prefix. Errors die with
+## `blog: <file>: <reason>`.
+
+package Blog::Post
+
+use Blog::Markdown
+
+val $WORDS_PER_MINUTE = 220
+
+## Split "---\nkey: value\n---\nbody" into (\%meta, $body).
+fn Blog::Post::front_matter ($path, $text) {
+    $text =~ s/\r//g
+    die "blog: $path: missing front matter\n" unless $text =~ /\A---[ \t]*\n(.*?)\n---[ \t]*\n?(.*)\z/s
+    my ($head, $body) = ($1, $2)
+    my %meta
+    for my $line (split /\n/, $head) {
+        next if $line =~ /^\s*(#|$)/
+        die "blog: $path: bad front matter line: $line\n" unless $line =~ /^\s*([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$/
+        my ($k, $v) = (lc $1, $2)
+        $v = $1 if $v =~ /^"(.*)"$/ || $v =~ /^'(.*)'$/
+        $meta{$k} = $v
+    }
+    (\%meta, $body)
+}
+
+## "[a, b]" or "a, b" → ("a", "b"), lowercased, de-duplicated, order kept.
+fn Blog::Post::parse_tags ($raw) {
+    return () unless defined $raw && length $raw
+    $raw =~ s/^\[//
+    $raw =~ s/\]$//
+    my %seen
+    grep { length && !$seen{$_}++ } map { lc(trim($_ =~ s/^["']|["']$//gr)) } split /,/, $raw
+}
+
+fn Blog::Post::slug_of ($path) {
+    my $name = basename($path)
+    $name =~ s/\.md$//
+    $name =~ s/^\d{4}-\d{2}-\d{2}-//
+    slugify($name)
+}
+
+## Parse one post. $text defaults to the file's contents.
+fn Blog::Post::parse ($path, $text = undef) {
+    $text //= slurp($path)
+    my ($meta, $body) = Blog::Post::front_matter($path, $text)
+    die "blog: $path: missing title\n" unless length($meta->{title} // "")
+    die "blog: $path: date must be YYYY-MM-DD\n" unless ($meta->{date} // "") =~ /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/
+    my @words = split /\s+/, trim($body =~ s/```.*?```//gsr)
+    val $words = scalar grep { /\w/ } @words
+    my %post = (
+        title   => $meta->{title},
+        date    => $meta->{date},
+        year    => substr($meta->{date}, 0, 4),
+        tags    => [Blog::Post::parse_tags($meta->{tags})],
+        summary => $meta->{summary} // "",
+        draft   => (($meta->{draft} // "") =~ /^(true|yes|1)$/i ? 1 : 0),
+        slug    => Blog::Post::slug_of($path),
+        source  => $path,
+        words   => $words,
+        minutes => $words ? int(($words + $WORDS_PER_MINUTE - 1) / $WORDS_PER_MINUTE) : 1,
+        html    => Blog::Markdown::to_html($body),
+    )
+    \%post
+}
+
+1

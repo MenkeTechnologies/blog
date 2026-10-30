@@ -1,0 +1,70 @@
+## t/test_markdown.stk — Blog::Markdown block + inline rendering.
+##
+## Pins the behaviours posts depend on: escaping (no raw HTML injection),
+## stash isolation (emphasis never rewrites URLs or code), list nesting,
+## table alignment, fenced-code highlighting, and heading ids.
+
+use Blog::Markdown
+
+fn mdh ($s) { Blog::Markdown::to_html($s) }
+fn inl ($s) { Blog::Markdown::inline($s) }
+
+# ── escaping ─────────────────────────────────────────────────────────
+assert_eq inl("1 < 2 & 3"), "1 &lt; 2 &amp; 3", "inline: text is HTML-escaped"
+assert_eq mdh("<script>alert(1)</script>"), "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n",
+    "raw HTML is escaped, never passed through"
+assert_eq inl("`<b>&`"), "<code>&lt;b&gt;&amp;</code>", "code span contents are escaped once"
+assert_eq inl("[x](javascript&<)"), "<a href=\"javascript&amp;&lt;\">x</a>", "link href is escaped"
+
+# ── emphasis ─────────────────────────────────────────────────────────
+assert_eq inl("**b** *i* _u_ ~~d~~"), "<strong>b</strong> <em>i</em> <em>u</em> <del>d</del>", "emphasis forms"
+assert_eq inl("snake_case_name and 2*3*4"), "snake_case_name and 2*3*4", "intraword _ and * are literal"
+assert_eq inl("`*not em*`"), "<code>*not em*</code>", "no emphasis inside code spans"
+
+# ── links / images / stash isolation ─────────────────────────────────
+assert_eq inl("[a](https://x.io/a_b_c)"),
+    "<a href=\"https://x.io/a_b_c\" target=\"_blank\" rel=\"noopener noreferrer\">a</a>",
+    "external link: new tab + rel, underscores in URL untouched"
+assert_eq inl("[a](../p.html)"), "<a href=\"../p.html\">a</a>", "relative link stays in-tab"
+assert_eq inl("[the `x_y` *fn*](p.html)"), "<a href=\"p.html\">the <code>x_y</code> <em>fn</em></a>",
+    "code span + emphasis inside link text"
+assert_eq inl("![alt_text](img/a_b.png)"), "<img src=\"img/a_b.png\" alt=\"alt_text\" loading=\"lazy\">",
+    "image: alt and src untouched by emphasis"
+assert_eq inl("<https://a.io/x>"),
+    "<a href=\"https://a.io/x\" target=\"_blank\" rel=\"noopener noreferrer\">https://a.io/x</a>", "autolink"
+
+# ── headings ─────────────────────────────────────────────────────────
+assert_eq mdh("## Hello, `World`!"), "<h2 id=\"hello-world\">Hello, <code>World</code>!</h2>\n", "heading id is slugified"
+assert_eq mdh("### Closed ###"), "<h3 id=\"closed\">Closed</h3>\n", "closing hashes stripped"
+
+# ── paragraphs / hr ──────────────────────────────────────────────────
+assert_eq mdh("a\nb\n\nc"), "<p>a\nb</p>\n<p>c</p>\n", "blank line separates paragraphs"
+assert_eq mdh("a\n---\nb"), "<p>a</p>\n<hr>\n<p>b</p>\n", "hr interrupts a paragraph"
+
+# ── lists ────────────────────────────────────────────────────────────
+assert_eq mdh("- a\n- b"), "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n", "tight unordered list"
+assert_eq mdh("3. c\n4. d"), "<ol start=\"3\">\n<li>c</li>\n<li>d</li>\n</ol>\n", "ordered list keeps start number"
+assert_eq mdh("1. a\n   - x\n   - y\n2. b"),
+    "<ol>\n<li>a\n<ul>\n<li>x</li>\n<li>y</li>\n</ul></li>\n<li>b</li>\n</ol>\n", "nested list by indentation"
+assert_eq mdh("- a\n- b\n\npara"), "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n<p>para</p>\n", "unindented paragraph ends the list"
+assert_eq mdh("- a\n\n  more\n- b"), "<ul>\n<li><p>a</p>\n<p>more</p></li>\n<li>b</li>\n</ul>\n", "loose item keeps paragraphs"
+assert_eq mdh("- a\n1. b"), "<ul>\n<li>a</li>\n</ul>\n<ol>\n<li>b</li>\n</ol>\n", "marker type change starts a new list"
+
+# ── blockquotes ──────────────────────────────────────────────────────
+assert_eq mdh("> a\n> b\n>\n> > c"), "<blockquote>\n<p>a\nb</p>\n<blockquote>\n<p>c</p>\n</blockquote>\n</blockquote>\n",
+    "multi-line + nested blockquote"
+
+# ── tables ───────────────────────────────────────────────────────────
+assert_eq mdh("| a | b | c |\n|:--|:-:|--:|\n| 1 | **2** |"),
+    "<table>\n<thead><tr><th style=\"text-align:left\">a</th><th style=\"text-align:center\">b</th><th style=\"text-align:right\">c</th></tr></thead>\n<tbody>\n<tr><td style=\"text-align:left\">1</td><td style=\"text-align:center\"><strong>2</strong></td><td style=\"text-align:right\"></td></tr>\n</tbody>\n</table>\n",
+    "pipe table: alignment, inline cells, short rows padded"
+assert_eq mdh("a | b"), "<p>a | b</p>\n", "a pipe without a separator row is just text"
+
+# ── fenced code ──────────────────────────────────────────────────────
+assert_eq mdh("```\n<a> **x**\n```"), "<pre><code>&lt;a&gt; **x**</code></pre>\n", "plain fence: escaped, no markup"
+assert_eq mdh("~~~text\n# not a heading\n~~~"), "<pre class=\"language-text\" data-lang=\"text\"><code># not a heading</code></pre>\n",
+    "tilde fence, unknown language is not highlighted"
+assert_contains mdh("```stryke\nval \$x = \"s\" # c\n```"),
+    "<span class=\"hl-kw\">val</span> <span class=\"hl-var\">\$x</span> = <span class=\"hl-string\">&quot;s&quot;</span> <span class=\"hl-comment\"># c</span>",
+    "stryke fence is highlighted"
+assert_eq mdh("```\nunclosed"), "<pre><code>unclosed</code></pre>\n", "unclosed fence runs to end of document"

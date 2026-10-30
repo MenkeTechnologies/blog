@@ -1,0 +1,192 @@
+/* MenkeTechnologies blog — blog layer on top of the stryke docs HUD.
+   Loads after hud-static.css + tutorial.css and only uses their CSS
+   variables, so every colour scheme / light mode applies automatically. */
+
+.tutorial-brand a { color: inherit; text-decoration: none; }
+.tutorial-brand a:hover { text-shadow: 0 0 10px var(--accent-glow); }
+
+.blog-build-line {
+  margin: 0.35rem 0 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.03em;
+  opacity: 0.75;
+}
+
+.blog-main { max-width: 64rem; width: 100%; }
+
+/* Colour-scheme strip under the header (same markup as the stryke docs hub;
+   its rules live inline in strykelang/docs/index.html, so they are carried
+   here rather than in the vendored hud-static.css). */
+.hub-scheme-strip {
+  border-bottom: 1px dashed var(--border);
+  background: color-mix(in srgb, var(--bg-secondary) 85%, transparent);
+  padding: 0.55rem 1.5rem 0.65rem;
+  position: relative;
+}
+.hub-scheme-strip-inner {
+  max-width: 64rem;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
+.hub-scheme-strip .hud-scheme-label {
+  flex: 0 0 auto;
+  font-family: 'Orbitron', sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.hub-scheme-strip .scheme-grid {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
+}
+@media (max-width: 960px) {
+  .hub-scheme-strip .scheme-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .hub-scheme-strip-inner { flex-direction: column; align-items: stretch; }
+  .hub-scheme-strip .scheme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* ── index / tag listings ─────────────────────────────────────────── */
+.post-list { display: grid; gap: 0.9rem; margin: 1.5rem 0; }
+
+.post-card {
+  position: relative;
+  padding: 0.9rem 1.1rem 1rem;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--cyan);
+  background: color-mix(in srgb, var(--bg-card) 92%, transparent);
+  border-radius: 2px;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.post-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.post-card-title {
+  margin: 0.3rem 0 0.35rem;
+  font-family: 'Orbitron', sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.post-card-title a { color: var(--text); text-decoration: none; }
+.post-card-title a:hover { color: var(--accent); }
+.post-card-summary { margin: 0; font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+
+.post-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.post-meta time { color: var(--cyan); }
+.post-meta .sep { margin: 0 0.3rem; opacity: 0.6; }
+
+.post-tag {
+  display: inline-block;
+  margin: 0 0.15rem;
+  color: var(--magenta);
+  text-decoration: none;
+}
+.post-tag:hover { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
+.tag-count { color: var(--text-muted); font-size: 10px; }
+
+.tag-cloud { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; font-size: 14px; }
+
+.archive-list { list-style: none; padding-left: 0 !important; }
+.archive-list time { color: var(--cyan); margin-right: 0.75rem; font-size: 12px; }
+.archive-list a { color: var(--text); text-decoration: none; }
+.archive-list a:hover { color: var(--accent); }
+
+.blog-empty { color: var(--text-dim); font-size: 13px; }
+
+/* ── post body ────────────────────────────────────────────────────── */
+.post-body { font-size: 14px; }
+.post-body > p, .post-body li { font-size: 14px; color: var(--text); line-height: 1.7; }
+.post-body > h1, .post-body > h2, .post-body > h3, .post-body > h4 {
+  margin: 1.4rem 0 0.5rem;
+  font-family: 'Orbitron', sans-serif;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+.post-body > h1 { font-size: 15px; color: var(--accent); }
+.post-body > h2 { font-size: 13px; color: var(--accent); }
+.post-body > h3 { font-size: 12px; color: var(--cyan); }
+.post-body > h4 { font-size: 11px; color: var(--text); }
+.post-body > :first-child { margin-top: 0; }
+.post-body a { color: var(--cyan); }
+.post-body a:hover { color: var(--accent); }
+.post-body img { max-width: 100%; border: 1px solid var(--border); border-radius: 2px; }
+.post-body hr { border: 0; border-top: 1px dashed var(--border); margin: 1.4rem 0; }
+.post-body del { color: var(--text-muted); }
+.post-body pre code { padding: 0; border: 0; background: none; color: inherit; font-size: inherit; }
+.post-body pre[data-lang] { position: relative; }
+.post-body pre[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0.3rem;
+  right: 0.6rem;
+  font-family: 'Orbitron', sans-serif;
+  font-size: 8px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.post-body blockquote {
+  margin: 0.8rem 0;
+  padding: 0.4rem 0.9rem;
+  border-left: 2px solid var(--magenta);
+  background: color-mix(in srgb, var(--magenta) 6%, transparent);
+}
+.post-body blockquote p { margin: 0.3rem 0; color: var(--text-dim); }
+
+.post-body table { width: 100%; border-collapse: collapse; margin: 0.8rem 0; font-size: 12px; }
+.post-body th {
+  background: var(--bg-secondary);
+  color: var(--cyan);
+  font-family: 'Orbitron', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  text-align: left;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+}
+.post-body td { padding: 6px 10px; border: 1px solid var(--border); color: var(--text-dim); vertical-align: top; }
+
+/* Build-time syntax highlighting (lib/Blog/Highlight.stk). */
+.hl-comment { color: var(--text-muted); font-style: italic; }
+.hl-string  { color: var(--green); }
+.hl-var     { color: var(--cyan); }
+.hl-num     { color: var(--magenta); }
+.hl-kw      { color: var(--accent); font-weight: 600; }
+.hl-op      { color: var(--accent-light); }
+
+/* ── footer ───────────────────────────────────────────────────────── */
+.blog-footer {
+  margin-top: auto;
+  padding: 1.2rem 1.5rem;
+  border-top: 1px dashed var(--border);
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 1px;
+}
+.blog-footer a { color: var(--text-dim); }
+.blog-footer a:hover { color: var(--accent); }
+.blog-footer .sep { margin: 0 0.4rem; }
+
+@media (max-width: 720px) {
+  .tutorial-nav { grid-template-columns: 1fr; }
+  .post-card-title { font-size: 13px; }
+}
