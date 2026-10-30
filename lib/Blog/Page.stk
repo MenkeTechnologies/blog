@@ -10,6 +10,9 @@ package Blog::Page
 
 fn Blog::Page::esc ($s) { html_encode($s // "") }
 
+## "1 post", "2 posts".
+fn Blog::Page::count ($n, $noun) { "$n $noun" . ($n == 1 ? "" : "s") }
+
 fn Blog::Page::tag_href ($rel, $tag) { $rel . "tags/" . slugify($tag) . ".html" }
 
 fn Blog::Page::tag_links ($rel, $tags) {
@@ -49,7 +52,7 @@ fn Blog::Page::layout (%a) {
     val $heading  = Blog::Page::esc($a{heading} // $site->{title})
     val $subtitle = defined $a{subtitle} ? qq{\n      <p class="tutorial-subtitle">$a{subtitle}</p>} : ""
     val $repo     = Blog::Page::esc($site->{repo})
-    val $stats    = "$site->{post_count} posts · $site->{tag_count} tags"
+    val $stats    = Blog::Page::count($site->{post_count}, "post") . " · " . Blog::Page::count($site->{tag_count}, "tag")
     my $crumbs = ""
     for my $c (["Posts", "index.html"], ["Archive", "archive.html"], ["Tags", "tags/index.html"], ["Feed", "feed.xml"]) {
         val ($label, $href) = @$c
@@ -208,7 +211,7 @@ fn Blog::Page::tag ($site, $tag, $posts) {
         title    => "#$tag",
         heading  => "#$tag",
         current  => "Tags",
-        subtitle => scalar(@$posts) . (scalar(@$posts) == 1 ? " post" : " posts") . qq{ tagged <code>} . Blog::Page::esc($tag) . "</code>",
+        subtitle => Blog::Page::count(scalar(@$posts), "post") . qq{ tagged <code>} . Blog::Page::esc($tag) . "</code>",
         body     => qq{      <section class="post-list">\n$cards      </section>},
     )
 }

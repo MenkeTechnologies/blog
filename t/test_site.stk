@@ -38,6 +38,7 @@ assert_contains $first, qq{href="../assets/hud-static.css"}, "post pages link as
 assert_contains slurp("$out/posts/old.html"), qq{nav-stub nav-prev}, "oldest post has no older link"
 
 assert_contains slurp("$out/tags/a.html"), "2 posts tagged", "tag page counts its posts"
+assert_contains slurp("$out/tags/b.html"), "1 post tagged", "singular post count"
 assert_match qr{"a\.html".*"b\.html"}s, slurp("$out/tags/index.html"), "tag index: most-used tag first"
 assert_contains slurp("$out/archive.html"), "<h2>2025</h2>", "archive groups by year"
 assert_contains slurp("$out/404.html"), qq{href="/blog/assets/blog.css"}, "404 uses absolute asset paths"
